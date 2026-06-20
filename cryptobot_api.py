@@ -1,47 +1,38 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+BASE_URL = "https://app.send.tg"
+ORIGIN = "https://app.send.tg"
+REFERER = "https://app.send.tg/p2c/orders"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"
+TAKE_BAGGAGE = "sentry-environment=mainnet,sentry-public_key=abd78de7be54ff3fb9f6b677ba8c3ae6,sentry-trace_id=328cbff155d3474eabdaa190238c187b,sentry-sampled=true,sentry-sample_rand=0.2629407266783538,sentry-sample_rate=1"
+TAKE_SENTRY_TRACE = "328cbff155d3474eabdaa190238c187b-af31f40ae5e4add9-1"
 
 
 @dataclass(slots=True)
 class CryptoBotAPI:
     cookie: str
-    base_url: str = "https://app.send.tg"
     timeout: int = 30
-    referer: str = "https://app.send.tg/p2c/orders"
-    origin: str = "https://app.send.tg"
-    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"
-    accept_language: str = "ru,en;q=0.9,en-GB;q=0.8,en-US;q=0.7"
-    baggage: str | None = None
-    sentry_trace: str | None = None
-    extra_headers: dict[str, str] = field(default_factory=dict)
 
     def get_onboarding_state(self) -> dict[str, Any]:
-        return self._get_json("/internal/v1/p2c/onboarding/state")
+        return self._request_json("GET", "/internal/v1/p2c/onboarding/state")
 
     def take_payment(self, order_id: str) -> dict[str, Any]:
-        return self._post_json(f"/internal/v1/p2c/payments/take/{order_id}")
+        return self._request_json(
+            "POST",
+            f"/internal/v1/p2c/payments/take/{order_id}",
+            baggage=TAKE_BAGGAGE,
+            sentry_trace=TAKE_SENTRY_TRACE,
+        )
 
-    def _get_json(self, path: str) -> dict[str, Any]:
-        req = Request(self.base_url + path, method="GET")
-        req.add_header("content-type", "application/json")
-        for key, value in self._headers().items():
-            req.add_header(key, value)
-        try:
-            with urlopen(req, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8", "replace"))
-        except HTTPError as exc:
-            raise RuntimeError(f"HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Request failed: {exc.reason}") from exc
-
-    def _post_json(self, path: str) -> dict[str, Any]:
-        req = Request(self.base_url + path, data=b"", method="POST")
-        for key, value in self._headers().items():
+    def _request_json(self, method: str, path: str, baggage: str | None = None, sentry_trace: str | None = None) -> dict[str, Any]:
+        req = Request(BASE_URL + path, data=b"" if method == "POST" else None, method=method)
+        for key, value in self._headers(baggage, sentry_trace).items():
             req.add_header(key, value)
         try:
             with urlopen(req, timeout=self.timeout) as response:
@@ -52,25 +43,16 @@ class CryptoBotAPI:
         except URLError as exc:
             raise RuntimeError(f"Request failed: {exc.reason}") from exc
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, baggage: str | None = None, sentry_trace: str | None = None) -> dict[str, str]:
         headers = {
             "accept": "application/json, text/plain, */*",
-            "accept-language": self.accept_language,
             "cookie": self.cookie,
-            "origin": self.origin,
-            "priority": "u=1, i",
-            "referer": self.referer,
-            "sec-ch-ua": '"Not)A;Brand";v="24", "Microsoft Edge WebView2";v="149", "Microsoft Edge";v="149", "Chromium";v="149"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "Windows",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": self.user_agent,
+            "origin": ORIGIN,
+            "referer": REFERER,
+            "user-agent": USER_AGENT,
         }
-        if self.baggage:
-            headers["baggage"] = self.baggage
-        if self.sentry_trace:
-            headers["sentry-trace"] = self.sentry_trace
-        headers.update(self.extra_headers)
+        if baggage:
+            headers["baggage"] = baggage
+        if sentry_trace:
+            headers["sentry-trace"] = sentry_trace
         return headers

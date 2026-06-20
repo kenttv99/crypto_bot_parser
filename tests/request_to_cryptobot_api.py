@@ -24,40 +24,15 @@ def load_env_file(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-def env(name: str, required: bool = True) -> str:
+def env(name: str) -> str:
     value = os.getenv(name, "")
-    if required and not value:
+    if not value:
         raise RuntimeError(f"Missing environment variable: {name}")
     return value
 
 
-def build_cookie_header(values: dict[str, str]) -> str:
-    return "; ".join(f"{key}={value}" for key, value in values.items() if value)
-
-
 load_env_file(ROOT / ".env.parametrs")
-
-COOKIE_VALUES = {
-    "access_token": env("HTTP_COOKIE_ACCESS_TOKEN"),
-    "did": env("HTTP_COOKIE_DID"),
-    "__cf_bm": env("HTTP_COOKIE_CF_BM", required=False),
-}
-
-COMMON_API = {
-    "origin": env("COMMON_ORIGIN"),
-    "referer": env("COMMON_REFERER"),
-    "user_agent": env("COMMON_USER_AGENT"),
-    "accept_language": env("COMMON_ACCEPT_LANGUAGE"),
-}
-SOCKET_CLIENT = {
-    "origin": env("SOCKET_ORIGIN"),
-    "user_agent": env("SOCKET_USER_AGENT"),
-    "accept_language": env("SOCKET_ACCEPT_LANGUAGE"),
-    "accept_encoding": env("SOCKET_ACCEPT_ENCODING"),
-}
-SOCKET_COOKIE_HEADER = env("SOCKET_COOKIE_HEADER")
-TAKE_BAGGAGE = env("TAKE_BAGGAGE")
-TAKE_SENTRY_TRACE = env("TAKE_SENTRY_TRACE")
+COOKIE_HEADER = env("COOKIE_HEADER")
 
 
 def main() -> None:
@@ -73,12 +48,11 @@ def main() -> None:
     if args.take and not args.order_id:
         parser.error("missing --order-id")
     if args.state:
-        print(json.dumps(CryptoBotAPI(build_cookie_header(COOKIE_VALUES), **COMMON_API).get_onboarding_state(), ensure_ascii=False, indent=2))
+        print(json.dumps(CryptoBotAPI(COOKIE_HEADER).get_onboarding_state(), ensure_ascii=False, indent=2))
     elif args.take:
-        api = CryptoBotAPI(build_cookie_header(COOKIE_VALUES), baggage=TAKE_BAGGAGE, sentry_trace=TAKE_SENTRY_TRACE, **COMMON_API)
-        print(json.dumps(api.take_payment(args.order_id), ensure_ascii=False, indent=2))
+        print(json.dumps(CryptoBotAPI(COOKIE_HEADER).take_payment(args.order_id), ensure_ascii=False, indent=2))
     else:
-        CryptoBotSocketClient(SOCKET_COOKIE_HEADER, save_json_path=args.save_json or None, **SOCKET_CLIENT).run()
+        CryptoBotSocketClient(COOKIE_HEADER, save_json_path=args.save_json or None).run()
 
 
 if __name__ == "__main__":

@@ -6,25 +6,23 @@ import os
 import socket
 import ssl
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+SOCKET_ORIGIN = "https://app.send.tg"
+SOCKET_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"
+
 
 @dataclass(slots=True)
 class CryptoBotSocketClient:
     cookie: str
-    url: str = "wss://app.send.tg/internal/v1/p2c-socket/?EIO=4&transport=websocket"
-    origin: str = "https://app.send.tg"
-    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"
-    accept_language: str = "ru,en;q=0.9,en-GB;q=0.8,en-US;q=0.7"
-    accept_encoding: str = "gzip, deflate, br, zstd"
-    timeout: int = 30
     save_json_path: str | None = None
-    extra_headers: dict[str, str] = field(default_factory=dict)
     initialized: bool = False
+    url: str = "wss://app.send.tg/internal/v1/p2c-socket/?EIO=4&transport=websocket"
+    timeout: int = 30
 
     def run(self) -> None:
         conn = self._connect()
@@ -45,8 +43,10 @@ class CryptoBotSocketClient:
         parsed = urlparse(self.url)
         if parsed.scheme != "wss":
             raise ValueError("url must use wss://")
-        raw = socket.create_connection((parsed.hostname, parsed.port or 443), timeout=self.timeout)
-        return ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
+        return ssl.create_default_context().wrap_socket(
+            socket.create_connection((parsed.hostname, parsed.port or 443), timeout=self.timeout),
+            server_hostname=parsed.hostname,
+        )
 
     def _negotiate(self, conn: ssl.SSLSocket) -> None:
         parsed = urlparse(self.url)
@@ -55,24 +55,16 @@ class CryptoBotSocketClient:
             f"GET {parsed.path}?{parsed.query} HTTP/1.1",
             f"Host: {parsed.hostname}",
             "Connection: Upgrade",
-            "Pragma: no-cache",
-            "Cache-Control: no-cache",
-            f"User-Agent: {self.user_agent}",
             "Upgrade: websocket",
-            f"Origin: {self.origin}",
+            f"Origin: {SOCKET_ORIGIN}",
             "Sec-WebSocket-Version: 13",
-            f"Accept-Encoding: {self.accept_encoding}",
-            f"Accept-Language: {self.accept_language}",
+            f"User-Agent: {SOCKET_USER_AGENT}",
             f"Cookie: {self.cookie}",
             f"Sec-WebSocket-Key: {key}",
-            "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
         ]
-        for key, value in self.extra_headers.items():
-            headers.append(f"{key}: {value}")
         conn.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
-        response = conn.recv(4096)
-        if b" 101 " not in response:
-            raise RuntimeError(response.decode("utf-8", "replace"))
+        if b" 101 " not in conn.recv(4096):
+            raise RuntimeError("websocket upgrade failed")
         conn.sendall(self._ws_frame("40"))
 
     def _read_message(self, conn: ssl.SSLSocket) -> str | None:
@@ -80,11 +72,9 @@ class CryptoBotSocketClient:
         if opcode == 8:
             return None
         if opcode == 9:
-            conn.sendall(self._frame(payload, 10))
+            conn.sendall(self._ws_frame("3"))
             return ""
-        if opcode != 1:
-            return ""
-        return payload.decode("utf-8", "replace")
+        return payload.decode("utf-8", "replace") if opcode == 1 else ""
 
     def _handle_message(self, conn: ssl.SSLSocket, message: str) -> None:
         if not message:
@@ -119,9 +109,7 @@ class CryptoBotSocketClient:
     def _parse_socketio_event(self, message: str) -> tuple[str, Any]:
         payload = json.loads(message[2:])
         if isinstance(payload, list) and payload:
-            event = str(payload[0])
-            data = payload[1] if len(payload) == 2 else payload[1:]
-            return event, data
+            return str(payload[0]), payload[1] if len(payload) == 2 else payload[1:]
         return "message", payload
 
     def _append_json(self, record: dict[str, Any]) -> None:
