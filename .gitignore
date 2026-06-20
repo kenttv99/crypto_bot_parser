@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Virtual environments
+venv/
+.venv/
+
+# Local secrets / runtime config
+.env
+.env.*
+!.env.example
+
+# Generated runtime data
+data/events.json
