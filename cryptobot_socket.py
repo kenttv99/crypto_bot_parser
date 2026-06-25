@@ -9,7 +9,7 @@ import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 SOCKET_ORIGIN = "https://app.send.tg"
@@ -24,7 +24,7 @@ class CryptoBotSocketClient:
     url: str = "wss://app.send.tg/internal/v1/p2c-socket/?EIO=4&transport=websocket"
     timeout: int = 30
 
-    def run(self) -> None:
+    def run(self, on_record: Callable[[dict[str, Any]], bool | None] | None = None) -> None:
         conn = self._connect()
         try:
             self._negotiate(conn)
@@ -32,7 +32,8 @@ class CryptoBotSocketClient:
                 message = self._read_message(conn)
                 if message is None:
                     return
-                self._handle_message(conn, message)
+                if self._handle_message(conn, message, on_record) is False:
+                    return
         finally:
             try:
                 conn.close()
@@ -43,10 +44,15 @@ class CryptoBotSocketClient:
         parsed = urlparse(self.url)
         if parsed.scheme != "wss":
             raise ValueError("url must use wss://")
-        return ssl.create_default_context().wrap_socket(
+        conn = ssl.create_default_context().wrap_socket(
             socket.create_connection((parsed.hostname, parsed.port or 443), timeout=self.timeout),
             server_hostname=parsed.hostname,
         )
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        return conn
 
     def _negotiate(self, conn: ssl.SSLSocket) -> None:
         parsed = urlparse(self.url)
@@ -76,19 +82,20 @@ class CryptoBotSocketClient:
             return ""
         return payload.decode("utf-8", "replace") if opcode == 1 else ""
 
-    def _handle_message(self, conn: ssl.SSLSocket, message: str) -> None:
+    def _handle_message(self, conn: ssl.SSLSocket, message: str, on_record: Callable[[dict[str, Any]], bool | None] | None = None) -> bool | None:
         if not message:
             return
-        print(message)
         parsed = self._parse_message(message)
         if parsed["type"] == "socketio_connect" and not self.initialized:
             conn.sendall(self._ws_frame('42["list:initialize"]'))
             self.initialized = True
         if parsed["type"] == "ping":
             conn.sendall(self._ws_frame("3"))
+        result = on_record(parsed) if on_record is not None else None
         self._append_json(parsed)
-        if parsed["type"] == "socketio_event" and parsed.get("event") == "list:update":
-            print(json.dumps(parsed["payload"], ensure_ascii=False))
+        if result is False:
+            return False
+        return None
 
     def _parse_message(self, message: str) -> dict[str, Any]:
         if message.startswith("0{"):

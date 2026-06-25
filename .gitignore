@@ -17,3 +17,4 @@ venv/
 
 # Generated runtime data
 data/events.json
+data/taken_orders.json

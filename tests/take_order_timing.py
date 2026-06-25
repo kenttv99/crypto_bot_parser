@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 import sys
-from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from time import perf_counter_ns
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,9 +13,6 @@ sys.path.insert(0, str(ROOT))
 from cryptobot_api import CryptoBotAPI
 from cryptobot_socket import CryptoBotSocketClient
 from runtime_config import env, load_env_file
-
-SAVE_PATH = ROOT / "data" / "taken_orders.json"
-LOG_LIMIT = 180
 
 
 def parse_limit(name: str) -> Decimal | None:
@@ -55,23 +51,8 @@ def extract_candidates(record: dict[str, Any]):
             yield item["data"]
 
 
-def append_record(path: Path, record: dict[str, Any]) -> None:
-    items: list[dict[str, Any]] = []
-    if path.exists():
-        try:
-            items = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            items = []
-        if not isinstance(items, list):
-            items = []
-    path.parent.mkdir(parents=True, exist_ok=True)
-    items.append(record)
-    path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def short_text(value: Any, limit: int = LOG_LIMIT) -> str:
-    text = json.dumps(value, ensure_ascii=False, separators=(",", ":")) if isinstance(value, (dict, list)) else str(value)
-    return text if len(text) <= limit else text[: limit - 3] + "..."
+def ms(ns: int) -> str:
+    return f"{ns / 1_000_000:.3f}ms"
 
 
 def main() -> None:
@@ -80,43 +61,44 @@ def main() -> None:
     min_limit = parse_limit("MIN_LIMIT_RUB")
     max_limit = parse_limit("MAX_LIMIT_RUB")
     ensure_limits(min_limit, max_limit)
+    started_at = perf_counter_ns()
     api = CryptoBotAPI(cookie)
     api.open()
-    seen_ids: set[str] = set()
 
     def on_record(record: dict[str, Any]) -> bool | None:
+        now = perf_counter_ns()
         if record.get("type") == "socketio_connect":
-            payload = record.get("payload")
-            sid = payload.get("sid", "") if isinstance(payload, dict) else ""
-            print(f"socket connected sid={sid}", flush=True)
+            print(f"connect={ms(now - started_at)}", flush=True)
             return None
         if record.get("type") != "socketio_event":
             return None
         for order in extract_candidates(record):
             order_id = str(order.get("id", ""))
-            if not order_id or order_id in seen_ids:
+            if not order_id:
                 continue
-            seen_ids.add(order_id)
             raw_amount = str(order.get("in_amount", "")).strip()
             if not raw_amount:
-                print(f"skip order id={order_id} reason=no_amount", flush=True)
                 continue
             try:
                 if not amount_in_range(raw_amount, min_limit, max_limit):
-                    print(f"skip order id={order_id} amount={raw_amount} payload={short_text(order)}", flush=True)
                     continue
             except InvalidOperation:
-                print(f"skip order id={order_id} amount={raw_amount} payload={short_text(order)}", flush=True)
                 continue
+            take_started_at = perf_counter_ns()
             try:
-                response = api.take_payment(order_id)
-            except RuntimeError as exc:
-                print(f"take failed id={order_id} amount={raw_amount} error={short_text(str(exc))}", flush=True)
+                api.take_payment(order_id)
+            except RuntimeError:
+                take_finished_at = perf_counter_ns()
+                print(
+                    f"decision={ms(take_started_at - now)} take={ms(take_finished_at - take_started_at)} total={ms(take_finished_at - now)}",
+                    flush=True,
+                )
                 continue
-            result = {"received_at": datetime.now(timezone.utc).isoformat(), "type": "taken_order", "order": order, "take_response": response}
-            append_record(SAVE_PATH, result)
-            print(f"take order id={order_id} amount={raw_amount}", flush=True)
-            print(json.dumps(response, ensure_ascii=False, indent=2), flush=True)
+            take_finished_at = perf_counter_ns()
+            print(
+                f"decision={ms(take_started_at - now)} take={ms(take_finished_at - take_started_at)} total={ms(take_finished_at - now)}",
+                flush=True,
+            )
             return False
         return None
 

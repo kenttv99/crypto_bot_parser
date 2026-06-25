@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -11,24 +10,7 @@ sys.path.insert(0, str(ROOT))
 
 from cryptobot_api import CryptoBotAPI
 from cryptobot_socket import CryptoBotSocketClient
-
-
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        item = line.strip()
-        if not item or item.startswith("#") or "=" not in item:
-            continue
-        key, value = item.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-def env(name: str) -> str:
-    value = os.getenv(name, "")
-    if not value:
-        raise RuntimeError(f"Missing environment variable: {name}")
-    return value
+from runtime_config import env, load_env_file
 
 
 load_env_file(ROOT / ".env.parametrs")
