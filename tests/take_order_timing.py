@@ -70,6 +70,7 @@ def main() -> None:
     started_at = perf_counter_ns()
     api = CryptoBotAPI(cookie, wait_take_response=wait_take_response)
     api.open()
+    seen_ids: set[str] = set()
 
     def on_record(record: dict[str, Any]) -> bool | None:
         now = perf_counter_ns()
@@ -80,8 +81,9 @@ def main() -> None:
             return None
         for order in extract_candidates(record):
             order_id = str(order.get("id", ""))
-            if not order_id:
+            if not order_id or order_id in seen_ids:
                 continue
+            seen_ids.add(order_id)
             raw_amount = str(order.get("in_amount", "")).strip()
             if not raw_amount:
                 continue
@@ -105,7 +107,6 @@ def main() -> None:
                 f"decision={ms(take_started_at - now)} take={ms(take_finished_at - take_started_at)} total={ms(take_finished_at - now)}",
                 flush=True,
             )
-            return False
         return None
 
     try:
