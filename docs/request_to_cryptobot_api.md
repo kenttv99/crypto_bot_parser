@@ -21,9 +21,11 @@ CLI для:
 
 ## Что осталось в коде
 
-- в `CryptoBotAPI` зашиты только необходимые постоянные заголовки и `baggage`/`sentry-trace` для `take`
+- в `CryptoBotAPI` зашиты постоянные заголовки для API/WebView-профиля
+- для каждого `take` генерируются свежие `baggage`/`sentry-trace`
 - в `CryptoBotSocketClient` оставлены только обязательные для handshake поля и `Origin`/`User-Agent`
-- browser-noise заголовки вроде `accept-language`, `priority`, `sec-ch-ua*`, `sec-fetch-*`, `cache-control`, `pragma`, `accept-encoding` убраны
+- для `take` добавлены browser headers из DevTools: `accept-language`, `priority`, `sec-ch-ua*`, `sec-fetch-*`
+- `accept-encoding` не задается вручную, чтобы обычный режим с чтением JSON-ответа не получил сжатый body без распаковки
 
 ## Поведение
 
