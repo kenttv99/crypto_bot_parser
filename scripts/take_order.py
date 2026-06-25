@@ -129,7 +129,6 @@ def main() -> None:
             print(f"take {'order' if response is not None else 'request sent'} id={order_id} amount={raw_amount}", flush=True)
             if response is not None:
                 print(json.dumps(response, ensure_ascii=False, indent=2), flush=True)
-            return False
         return None
 
     try:
