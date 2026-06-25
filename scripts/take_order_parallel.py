@@ -176,7 +176,10 @@ class ParallelTaker:
             if record.get("type") == "socketio_connect":
                 payload = record.get("payload")
                 sid = payload.get("sid", "") if isinstance(payload, dict) else ""
-                print(f"worker={worker_id} socket connected sid={sid}", flush=True)
+                edge_headers = record.get("edge_headers")
+                cf_ray = edge_headers.get("cf-ray", "") if isinstance(edge_headers, dict) else ""
+                cf_colo = edge_headers.get("cf-colo", "") if isinstance(edge_headers, dict) else ""
+                print(f"worker={worker_id} socket connected sid={sid} cf_ray={cf_ray} colo={cf_colo}", flush=True)
                 return None
             if record.get("type") != "socketio_event":
                 return None

@@ -23,6 +23,7 @@ class CryptoBotSocketClient:
     initialized: bool = False
     url: str = "wss://app.send.tg/internal/v1/p2c-socket/?EIO=4&transport=websocket"
     timeout: int = 30
+    edge_headers: dict[str, str] | None = None
 
     def run(self, on_record: Callable[[dict[str, Any]], bool | None] | None = None) -> None:
         conn = self._connect()
@@ -69,7 +70,9 @@ class CryptoBotSocketClient:
             f"Sec-WebSocket-Key: {key}",
         ]
         conn.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
-        if b" 101 " not in conn.recv(4096):
+        response = conn.recv(4096)
+        self.edge_headers = self._parse_upgrade_headers(response)
+        if b" 101 " not in response:
             raise RuntimeError("websocket upgrade failed")
         conn.sendall(self._ws_frame("40"))
 
@@ -101,7 +104,10 @@ class CryptoBotSocketClient:
         if message.startswith("0{"):
             return {"received_at": self._now(), "type": "engine_open", **json.loads(message[1:]), "raw": message}
         if message.startswith("40{"):
-            return {"received_at": self._now(), "type": "socketio_connect", "payload": json.loads(message[2:]), "raw": message}
+            record = {"received_at": self._now(), "type": "socketio_connect", "payload": json.loads(message[2:]), "raw": message}
+            if self.edge_headers:
+                record["edge_headers"] = self.edge_headers
+            return record
         if message == "2":
             return {"received_at": self._now(), "type": "ping"}
         if message == "3":
@@ -118,6 +124,18 @@ class CryptoBotSocketClient:
         if isinstance(payload, list) and payload:
             return str(payload[0]), payload[1] if len(payload) == 2 else payload[1:]
         return "message", payload
+
+    def _parse_upgrade_headers(self, response: bytes) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for line in response.decode("iso-8859-1", "replace").split("\r\n")[1:]:
+            if not line or ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            headers[name.strip().lower()] = value.strip()
+        cf_ray = headers.get("cf-ray", "")
+        if cf_ray and "-" in cf_ray:
+            headers["cf-colo"] = cf_ray.rsplit("-", 1)[1]
+        return headers
 
     def _append_json(self, record: dict[str, Any]) -> None:
         if not self.save_json_path:
