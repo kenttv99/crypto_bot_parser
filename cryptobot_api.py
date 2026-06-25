@@ -4,6 +4,7 @@ import http.client
 import json
 import socket
 from dataclasses import dataclass, field
+from threading import Lock, Thread
 from typing import Any
 from urllib.parse import urlparse
 
@@ -22,6 +23,7 @@ class CryptoBotAPI:
     timeout: int = 30
     wait_take_response: bool = True
     _connection: http.client.HTTPSConnection | None = field(default=None, init=False, repr=False)
+    _connection_lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def open(self) -> None:
         self._ensure_connection()
@@ -71,7 +73,11 @@ class CryptoBotAPI:
         headers = self._headers(baggage, sentry_trace)
         body = b"" if method == "POST" else None
         conn = self._ensure_connection()
-        conn.request(method, path, body=body, headers=headers)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+        finally:
+            self._drop_connection()
+            Thread(target=self._preconnect_silently, daemon=True).start()
 
     def _headers(self, baggage: str | None = None, sentry_trace: str | None = None) -> dict[str, str]:
         headers = {
@@ -88,19 +94,27 @@ class CryptoBotAPI:
         return headers
 
     def _ensure_connection(self) -> http.client.HTTPSConnection:
-        if self._connection is None:
-            self._connection = http.client.HTTPSConnection(BASE_HOST, timeout=self.timeout)
-        if self._connection.sock is None:
-            self._connection.connect()
-            try:
-                self._connection.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except OSError:
-                pass
-        return self._connection
+        with self._connection_lock:
+            if self._connection is None:
+                self._connection = http.client.HTTPSConnection(BASE_HOST, timeout=self.timeout)
+            if self._connection.sock is None:
+                self._connection.connect()
+                try:
+                    self._connection.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+            return self._connection
 
     def _drop_connection(self) -> None:
-        if self._connection is not None:
-            try:
-                self._connection.close()
-            finally:
-                self._connection = None
+        with self._connection_lock:
+            if self._connection is not None:
+                try:
+                    self._connection.close()
+                finally:
+                    self._connection = None
+
+    def _preconnect_silently(self) -> None:
+        try:
+            self.open()
+        except OSError:
+            self._drop_connection()
