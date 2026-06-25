@@ -22,6 +22,7 @@ class CryptoBotAPI:
     cookie: str
     timeout: int = 30
     wait_take_response: bool = True
+    preconnect_after_send: bool = False
     _connection: http.client.HTTPSConnection | None = field(default=None, init=False, repr=False)
     _connection_lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
@@ -29,11 +30,7 @@ class CryptoBotAPI:
         self._ensure_connection()
 
     def close(self) -> None:
-        if self._connection is not None:
-            try:
-                self._connection.close()
-            finally:
-                self._connection = None
+        self._drop_connection()
 
     def get_onboarding_state(self) -> dict[str, Any]:
         return self._request_json("GET", "/internal/v1/p2c/onboarding/state")
@@ -77,7 +74,8 @@ class CryptoBotAPI:
             conn.request(method, path, body=body, headers=headers)
         finally:
             self._drop_connection()
-            Thread(target=self._preconnect_silently, daemon=True).start()
+            if self.preconnect_after_send:
+                Thread(target=self._preconnect_silently, daemon=True).start()
 
     def _headers(self, baggage: str | None = None, sentry_trace: str | None = None) -> dict[str, str]:
         headers = {
