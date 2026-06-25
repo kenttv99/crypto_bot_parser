@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import http.client
 import json
+import random
 import socket
+import secrets
 from dataclasses import dataclass, field
 from threading import Lock, Thread
 from typing import Any
@@ -13,8 +15,8 @@ BASE_HOST = urlparse(BASE_URL).hostname or "app.send.tg"
 ORIGIN = "https://app.send.tg"
 REFERER = "https://app.send.tg/p2c/orders"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"
-TAKE_BAGGAGE = "sentry-environment=mainnet,sentry-public_key=abd78de7be54ff3fb9f6b677ba8c3ae6,sentry-trace_id=328cbff155d3474eabdaa190238c187b,sentry-sampled=true,sentry-sample_rand=0.2629407266783538,sentry-sample_rate=1"
-TAKE_SENTRY_TRACE = "328cbff155d3474eabdaa190238c187b-af31f40ae5e4add9-1"
+SENTRY_RELEASE = "0.0.1037"
+SENTRY_PUBLIC_KEY = "abd78de7be54ff3fb9f6b677ba8c3ae6"
 
 
 @dataclass(slots=True)
@@ -37,14 +39,15 @@ class CryptoBotAPI:
 
     def take_payment(self, order_id: str) -> dict[str, Any] | None:
         path = f"/internal/v1/p2c/payments/take/{order_id}"
+        baggage, sentry_trace = self._sentry_headers()
         if not self.wait_take_response:
-            self._send("POST", path, baggage=TAKE_BAGGAGE, sentry_trace=TAKE_SENTRY_TRACE)
+            self._send("POST", path, baggage=baggage, sentry_trace=sentry_trace)
             return None
         return self._request_json(
             "POST",
             path,
-            baggage=TAKE_BAGGAGE,
-            sentry_trace=TAKE_SENTRY_TRACE,
+            baggage=baggage,
+            sentry_trace=sentry_trace,
         )
 
     def _request_json(self, method: str, path: str, baggage: str | None = None, sentry_trace: str | None = None) -> dict[str, Any]:
@@ -80,9 +83,17 @@ class CryptoBotAPI:
     def _headers(self, baggage: str | None = None, sentry_trace: str | None = None) -> dict[str, str]:
         headers = {
             "accept": "application/json, text/plain, */*",
+            "accept-language": "ru,en;q=0.9,en-GB;q=0.8,en-US;q=0.7",
             "cookie": self.cookie,
             "origin": ORIGIN,
+            "priority": "u=1, i",
             "referer": REFERER,
+            "sec-ch-ua": '"Not)A;Brand";v="24", "Microsoft Edge WebView2";v="149", "Microsoft Edge";v="149", "Chromium";v="149"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
             "user-agent": USER_AGENT,
         }
         if baggage:
@@ -90,6 +101,16 @@ class CryptoBotAPI:
         if sentry_trace:
             headers["sentry-trace"] = sentry_trace
         return headers
+
+    def _sentry_headers(self) -> tuple[str, str]:
+        trace_id = secrets.token_hex(16)
+        span_id = secrets.token_hex(8)
+        sample_rand = random.random()
+        baggage = (
+            f"sentry-environment=mainnet,sentry-release={SENTRY_RELEASE},sentry-public_key={SENTRY_PUBLIC_KEY},"
+            f"sentry-trace_id={trace_id},sentry-sampled=true,sentry-sample_rand={sample_rand},sentry-sample_rate=1"
+        )
+        return baggage, f"{trace_id}-{span_id}-1"
 
     def _ensure_connection(self) -> http.client.HTTPSConnection:
         with self._connection_lock:
