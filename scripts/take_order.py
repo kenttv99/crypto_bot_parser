@@ -34,6 +34,11 @@ def ensure_limits(min_limit: Decimal | None, max_limit: Decimal | None) -> None:
         raise RuntimeError("MIN_LIMIT_RUB cannot be greater than MAX_LIMIT_RUB")
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return default if not value else value in {"1", "true", "yes", "on"}
+
+
 def amount_in_range(amount: str, min_limit: Decimal | None, max_limit: Decimal | None) -> bool:
     value = Decimal(amount)
     return (min_limit is None or value >= min_limit) and (max_limit is None or value <= max_limit)
@@ -80,7 +85,8 @@ def main() -> None:
     min_limit = parse_limit("MIN_LIMIT_RUB")
     max_limit = parse_limit("MAX_LIMIT_RUB")
     ensure_limits(min_limit, max_limit)
-    api = CryptoBotAPI(cookie)
+    wait_take_response = env_bool("WAIT_TAKE_RESPONSE", True)
+    api = CryptoBotAPI(cookie, wait_take_response=wait_take_response)
     api.open()
     seen_ids: set[str] = set()
 
@@ -113,10 +119,16 @@ def main() -> None:
             except RuntimeError as exc:
                 print(f"take failed id={order_id} amount={raw_amount} error={short_text(str(exc))}", flush=True)
                 continue
-            result = {"received_at": datetime.now(timezone.utc).isoformat(), "type": "taken_order", "order": order, "take_response": response}
+            result = {
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "type": "taken_order" if response is not None else "take_request_sent",
+                "order": order,
+                "take_response": response,
+            }
             append_record(SAVE_PATH, result)
-            print(f"take order id={order_id} amount={raw_amount}", flush=True)
-            print(json.dumps(response, ensure_ascii=False, indent=2), flush=True)
+            print(f"take {'order' if response is not None else 'request sent'} id={order_id} amount={raw_amount}", flush=True)
+            if response is not None:
+                print(json.dumps(response, ensure_ascii=False, indent=2), flush=True)
             return False
         return None
 

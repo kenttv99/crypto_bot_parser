@@ -30,6 +30,11 @@ def ensure_limits(min_limit: Decimal | None, max_limit: Decimal | None) -> None:
         raise RuntimeError("MIN_LIMIT_RUB cannot be greater than MAX_LIMIT_RUB")
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return default if not value else value in {"1", "true", "yes", "on"}
+
+
 def amount_in_range(amount: str, min_limit: Decimal | None, max_limit: Decimal | None) -> bool:
     value = Decimal(amount)
     return (min_limit is None or value >= min_limit) and (max_limit is None or value <= max_limit)
@@ -61,8 +66,9 @@ def main() -> None:
     min_limit = parse_limit("MIN_LIMIT_RUB")
     max_limit = parse_limit("MAX_LIMIT_RUB")
     ensure_limits(min_limit, max_limit)
+    wait_take_response = env_bool("WAIT_TAKE_RESPONSE", True)
     started_at = perf_counter_ns()
-    api = CryptoBotAPI(cookie)
+    api = CryptoBotAPI(cookie, wait_take_response=wait_take_response)
     api.open()
 
     def on_record(record: dict[str, Any]) -> bool | None:

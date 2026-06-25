@@ -20,6 +20,7 @@ TAKE_SENTRY_TRACE = "328cbff155d3474eabdaa190238c187b-af31f40ae5e4add9-1"
 class CryptoBotAPI:
     cookie: str
     timeout: int = 30
+    wait_take_response: bool = True
     _connection: http.client.HTTPSConnection | None = field(default=None, init=False, repr=False)
 
     def open(self) -> None:
@@ -35,10 +36,14 @@ class CryptoBotAPI:
     def get_onboarding_state(self) -> dict[str, Any]:
         return self._request_json("GET", "/internal/v1/p2c/onboarding/state")
 
-    def take_payment(self, order_id: str) -> dict[str, Any]:
+    def take_payment(self, order_id: str) -> dict[str, Any] | None:
+        path = f"/internal/v1/p2c/payments/take/{order_id}"
+        if not self.wait_take_response:
+            self._send("POST", path, baggage=TAKE_BAGGAGE, sentry_trace=TAKE_SENTRY_TRACE)
+            return None
         return self._request_json(
             "POST",
-            f"/internal/v1/p2c/payments/take/{order_id}",
+            path,
             baggage=TAKE_BAGGAGE,
             sentry_trace=TAKE_SENTRY_TRACE,
         )
@@ -61,6 +66,12 @@ class CryptoBotAPI:
                     continue
                 raise RuntimeError(f"Request failed: {exc}") from exc
         raise RuntimeError("Request failed")
+
+    def _send(self, method: str, path: str, baggage: str | None = None, sentry_trace: str | None = None) -> None:
+        headers = self._headers(baggage, sentry_trace)
+        body = b"" if method == "POST" else None
+        conn = self._ensure_connection()
+        conn.request(method, path, body=body, headers=headers)
 
     def _headers(self, baggage: str | None = None, sentry_trace: str | None = None) -> dict[str, str]:
         headers = {

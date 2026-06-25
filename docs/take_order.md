@@ -9,6 +9,7 @@
 - `COOKIE_HEADER` - полный raw `Cookie` header
 - `MIN_LIMIT_RUB` - нижняя граница, пусто = без нижней границы
 - `MAX_LIMIT_RUB` - верхняя граница, пусто = без верхней границы
+- `WAIT_TAKE_RESPONSE` - `true` ждет HTTP-ответ `take`, `false` возвращается сразу после отправки POST
 - если задан только один лимит, второй край диапазона считается открытым
 
 ## Поведение
@@ -16,7 +17,8 @@
 - если `MIN_LIMIT_RUB > MAX_LIMIT_RUB`, скрипт завершается с ошибкой
 - ордеры берутся из событий `list:snapshot` и `list:update`
 - первый подходящий ордер останавливает слушание сокета
-- ответ endpoint `take_payment` печатается в консоль
+- при `WAIT_TAKE_RESPONSE=true` ответ endpoint `take_payment` печатается в консоль
+- при `WAIT_TAKE_RESPONSE=false` в лог пишется факт отправки запроса без подтверждения HTTP-ответом
 - взятый ордер сохраняется в `data/taken_orders.json`
 
 ## Запуск
