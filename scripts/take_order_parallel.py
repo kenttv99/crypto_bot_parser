@@ -95,23 +95,11 @@ def ms(ns: int) -> str:
 
 class TakePool:
     def __init__(self, cookie: str, wait_take_response: bool, size: int) -> None:
-        self.cookie = cookie
-        self.wait_take_response = wait_take_response
-        self.size = size
-        self.lock = Lock()
-        self.clients: list[CryptoBotAPI] = []
-        self.closed = False
-        for _ in range(size):
-            self._add_ready_client()
+        self.api = CryptoBotAPI(cookie, wait_take_response=wait_take_response, max_connections=size)
+        self.api.open()
 
     def take(self, order_id: str) -> dict[str, Any] | None:
-        api = self._pop()
-        try:
-            return api.take_payment(order_id)
-        finally:
-            api.close()
-            if not self.wait_take_response:
-                Thread(target=self._add_ready_client, daemon=True).start()
+        return self.api.take_payment(order_id)
 
     def take_burst(self, order_id: str, attempts: int) -> list[dict[str, Any] | None]:
         if attempts == 1:
@@ -137,33 +125,7 @@ class TakePool:
         return results
 
     def close(self) -> None:
-        with self.lock:
-            self.closed = True
-            clients, self.clients = self.clients, []
-        for api in clients:
-            api.close()
-
-    def _pop(self) -> CryptoBotAPI:
-        with self.lock:
-            if self.clients:
-                return self.clients.pop()
-        return self._new_ready_client()
-
-    def _add_ready_client(self) -> None:
-        try:
-            api = self._new_ready_client()
-        except OSError:
-            return
-        with self.lock:
-            if self.closed:
-                api.close()
-            else:
-                self.clients.append(api)
-
-    def _new_ready_client(self) -> CryptoBotAPI:
-        api = CryptoBotAPI(self.cookie, wait_take_response=self.wait_take_response)
-        api.open()
-        return api
+        self.api.close()
 
 
 class TakeRateLimiter:

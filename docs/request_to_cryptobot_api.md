@@ -22,10 +22,11 @@ CLI для:
 ## Что осталось в коде
 
 - в `CryptoBotAPI` зашиты постоянные заголовки для API/WebView-профиля
+- `CryptoBotAPI` использует HTTP/2 transport через `httpx`
 - для каждого `take` генерируются свежие `baggage`/`sentry-trace`
 - в `CryptoBotSocketClient` оставлены только обязательные для handshake поля и `Origin`/`User-Agent`
 - для `take` добавлены browser headers из DevTools: `accept-language`, `priority`, `sec-ch-ua*`, `sec-fetch-*`
-- `accept-encoding` не задается вручную, чтобы обычный режим с чтением JSON-ответа не получил сжатый body без распаковки
+- `accept-encoding` не задается вручную, распаковкой ответа занимается HTTP-клиент
 
 ## Поведение
 

@@ -25,26 +25,26 @@
 - `scripts/take_order.py` использует одно websocket-соединение и сохраняет записи в `data/taken_orders.json`
 - `scripts/take_order_parallel.py` использует несколько websocket-соединений и сохраняет записи в `data/taken_orders_parallel.jsonl`
 - в `take`-запросе генерируются свежие `baggage`/`sentry-trace`, добавлены browser headers из WebView-профиля
-- `--take-attempts N` отправляет до `N` параллельных `take`-запросов на один подходящий ордер через разные preconnected HTTPS-соединения
+- `--take-attempts N` отправляет до `N` параллельных `take`-запросов на один подходящий ордер через HTTP/2 transport
 
 ## Parallel mode
 
 `scripts/take_order_parallel.py` открывает несколько websocket-соединений с одним cookie. Первый worker, который увидел новый подходящий `order_id`, отправляет `take`; остальные workers игнорируют этот `order_id` через общий `seen_ids` lock.
 
-Для `take` используется общий пул заранее открытых HTTPS-соединений. Это снижает выбросы задержки, когда несколько подходящих ордеров приходят подряд и одно соединение уже было израсходовано send-only запросом.
+Для `take` используется общий HTTP/2 client. Burst-запросы идут параллельно через multiplexing, без отдельного HTTP/1.1 соединения на каждую попытку.
 
 Если включен `--take-attempts`, один worker делает burst из нескольких параллельных POST на один и тот же `order_id`. Значение не может быть больше `--take-pool-size`.
 
 Перед отправкой `take` скрипт резервирует квоту по всем лимитам из `.env.parametrs`. Если доступной квоты меньше, чем `--take-attempts`, burst уменьшается до доступного количества. Если квоты нет, ордер пропускается с `reason=take_rate_limit`.
 
-В режиме `WAIT_TAKE_RESPONSE=false` после send-only отправки использованное соединение закрывается, а пул пополняется новым preconnected соединением в фоне.
+В режиме `WAIT_TAKE_RESPONSE=false` клиент закрывает response stream сразу после получения HTTP headers.
 
 Skip-логи по умолчанию выключены, чтобы не тратить время на `json.dumps` payload и `stdout flush` в горячем пути. Для отладки их можно включить флагом `--log-skips`.
 
 Флаги:
 
 - `--connections`, `-c` - количество параллельных websocket-соединений, по умолчанию `3`
-- `--take-pool-size` - количество заранее открытых HTTPS-соединений для `take`, по умолчанию `16`
+- `--take-pool-size` - максимум HTTP-соединений transport для `take`, по умолчанию `16`
 - `--take-attempts` - количество параллельных `take` POST на один подходящий ордер, по умолчанию `1`
 - `--socket-timeout` - timeout чтения websocket в секундах, по умолчанию `120`
 - `--reconnect-delay` - пауза перед переподключением websocket, по умолчанию `0.2`
