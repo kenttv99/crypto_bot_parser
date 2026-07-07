@@ -376,7 +376,11 @@ class ParallelTaker:
         if allowed_attempts < 1:
             print(f"worker={worker_id} skip order id={order_id} amount={raw_amount} reason=take_rate_limit", flush=True)
             return
-        self.queue.put(TakeCandidate(worker_id, order, raw_amount, allowed_attempts, created_at, received_wall_at, received_at, perf_counter_ns(), ws_edge_headers))
+        candidate = TakeCandidate(worker_id, order, raw_amount, allowed_attempts, created_at, received_wall_at, received_at, perf_counter_ns(), ws_edge_headers)
+        if self.wait_take_response:
+            self.queue.put(candidate)
+            return
+        self._take_candidate(worker_id, candidate)
 
     def _take_candidate(self, take_worker_id: int, candidate: TakeCandidate) -> None:
         order_id = str(candidate.order.get("id", ""))
@@ -496,7 +500,7 @@ def main() -> None:
         rate_limiter,
         args.log_skips,
     )
-    take_threads = [Thread(target=taker.run_take_worker, args=(worker_id,), daemon=True) for worker_id in range(1, args.take_workers + 1)]
+    take_threads = [] if not wait_take_response else [Thread(target=taker.run_take_worker, args=(worker_id,), daemon=True) for worker_id in range(1, args.take_workers + 1)]
     response_thread = Thread(target=taker.run_response_logger, daemon=True)
     threads = [Thread(target=taker.run_worker, args=(worker_id,), daemon=False) for worker_id in range(1, args.connections + 1)]
     try:
