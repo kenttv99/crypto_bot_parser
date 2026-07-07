@@ -179,7 +179,8 @@ class CryptoBotAPI:
 
 
 class RawH2TakeConnection:
-    def __init__(self, cookie: str, timeout: float) -> None:
+    def __init__(self, connection_id: int, cookie: str, timeout: float) -> None:
+        self.connection_id = connection_id
         self.timeout = timeout
         self.closed = False
         self.lock = Lock()
@@ -215,14 +216,23 @@ class RawH2TakeConnection:
                     self.sock.sendall(data)
                     sent_ns = perf_counter_ns()
                     self.pending[stream_id] = {"order_id": order_id, "sent_ns": sent_ns, "headers": {}, "body": bytearray()}
-                return TakeHTTPResult(None, None, "", {"mode": "raw-h2", "stream_id": str(stream_id)}, None, started_ns, sent_ns, sent_ns)
+                return TakeHTTPResult(
+                    None,
+                    None,
+                    "",
+                    {"mode": "raw-h2", "connection_id": str(self.connection_id), "stream_id": str(stream_id)},
+                    None,
+                    started_ns,
+                    sent_ns,
+                    sent_ns,
+                )
             except Exception as exc:
                 error = str(exc)
                 with self.lock:
                     self._reset_locked()
                 continue
         finished_ns = perf_counter_ns()
-        return TakeHTTPResult(None, None, "", {"mode": "raw-h2"}, error, started_ns, finished_ns, finished_ns)
+        return TakeHTTPResult(None, None, "", {"mode": "raw-h2", "connection_id": str(self.connection_id)}, error, started_ns, finished_ns, finished_ns)
 
     def _headers(self, order_id: str) -> list[tuple[str, str]]:
         baggage, sentry_trace = self.header_builder._sentry_headers()
@@ -343,7 +353,7 @@ class RawH2TakeConnection:
                 str(meta.get("order_id", "")),
                 stream_id,
                 status,
-                dict(meta.get("headers", {})),
+                {"connection_id": str(self.connection_id), **dict(meta.get("headers", {}))},
                 self._parse_body_json(text),
                 text,
                 error,
@@ -384,14 +394,18 @@ class RawH2TakePool:
         self.size = size
         self.lock = Lock()
         self.next_index = 0
-        self.connections = [RawH2TakeConnection(cookie, timeout) for _ in range(size)]
+        self.connections = [RawH2TakeConnection(index + 1, cookie, timeout) for index in range(size)]
 
     def open(self) -> None:
+        errors: list[str] = []
         for connection in self.connections:
             try:
                 connection.open()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"{connection.connection_id}:{exc}")
+        if errors:
+            self.close()
+            raise RuntimeError(f"raw h2 preconnect failed: {', '.join(errors[:5])}")
 
     def close(self) -> None:
         for connection in self.connections:
