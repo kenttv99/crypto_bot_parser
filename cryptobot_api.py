@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import random
 import secrets
+import socket
+import ssl
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import Lock, Thread
 from time import perf_counter_ns
 from typing import Any
+from urllib.parse import urlparse
 
+from h2.config import H2Configuration
+from h2.connection import H2Connection
 import httpx
 
 BASE_URL = "https://app.send.tg"
@@ -155,3 +160,151 @@ class CryptoBotAPI:
             f"sentry-trace_id={trace_id},sentry-sampled=true,sentry-sample_rand={sample_rand},sentry-sample_rate=1"
         )
         return baggage, f"{trace_id}-{span_id}-1"
+
+
+class RawH2TakeConnection:
+    def __init__(self, cookie: str, timeout: float) -> None:
+        self.timeout = timeout
+        self.closed = False
+        self.lock = Lock()
+        self.header_builder = CryptoBotAPI(cookie)
+        self.sock: ssl.SSLSocket | None = None
+        self.conn: H2Connection | None = None
+        self.reader: Thread | None = None
+
+    def open(self) -> None:
+        self._connect_locked()
+
+    def close(self) -> None:
+        with self.lock:
+            self.closed = True
+            sock, self.sock = self.sock, None
+        if sock is not None:
+            self._close_socket(sock)
+
+    def send_take(self, order_id: str) -> TakeHTTPResult:
+        started_ns = perf_counter_ns()
+        for _ in range(2):
+            try:
+                with self.lock:
+                    if self.sock is None or self.conn is None:
+                        self._connect_locked()
+                    assert self.sock is not None and self.conn is not None
+                    stream_id = self.conn.get_next_available_stream_id()
+                    self.conn.send_headers(stream_id, self._headers(order_id), end_stream=True)
+                    data = self.conn.data_to_send()
+                    started_ns = perf_counter_ns()
+                    self.sock.sendall(data)
+                    sent_ns = perf_counter_ns()
+                return TakeHTTPResult(None, None, "", {"mode": "raw-h2", "stream_id": str(stream_id)}, None, started_ns, sent_ns, sent_ns)
+            except Exception as exc:
+                error = str(exc)
+                with self.lock:
+                    self._reset_locked()
+                continue
+        finished_ns = perf_counter_ns()
+        return TakeHTTPResult(None, None, "", {"mode": "raw-h2"}, error, started_ns, finished_ns, finished_ns)
+
+    def _headers(self, order_id: str) -> list[tuple[str, str]]:
+        baggage, sentry_trace = self.header_builder._sentry_headers()
+        headers = self.header_builder._headers(baggage, sentry_trace)
+        path = f"/internal/v1/p2c/payments/take/{order_id}"
+        result = [
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":authority", "app.send.tg"),
+            (":path", path),
+            ("content-length", "0"),
+        ]
+        result.extend((name.lower(), value) for name, value in headers.items() if name.lower() not in {"connection", "host", "content-length"})
+        return result
+
+    def _connect_locked(self) -> None:
+        if self.closed:
+            raise RuntimeError("raw h2 connection pool is closed")
+        parsed = urlparse(BASE_URL)
+        host = parsed.hostname or "app.send.tg"
+        raw = socket.create_connection((host, parsed.port or 443), timeout=self.timeout)
+        raw.settimeout(self.timeout)
+        try:
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        context = ssl.create_default_context()
+        context.set_alpn_protocols(["h2"])
+        sock = context.wrap_socket(raw, server_hostname=host)
+        if sock.selected_alpn_protocol() != "h2":
+            self._close_socket(sock)
+            raise RuntimeError("server did not negotiate h2")
+        conn = H2Connection(config=H2Configuration(client_side=True, header_encoding="utf-8"))
+        conn.initiate_connection()
+        sock.sendall(conn.data_to_send())
+        self.sock = sock
+        self.conn = conn
+        self.reader = Thread(target=self._read_loop, daemon=True)
+        self.reader.start()
+
+    def _read_loop(self) -> None:
+        while True:
+            with self.lock:
+                if self.closed:
+                    return
+                sock = self.sock
+            if sock is None:
+                return
+            try:
+                data = sock.recv(65536)
+                if not data:
+                    raise OSError("h2 socket closed")
+                with self.lock:
+                    if sock is not self.sock or self.conn is None:
+                        return
+                    self.conn.receive_data(data)
+                    outbound = self.conn.data_to_send()
+                    if outbound:
+                        sock.sendall(outbound)
+            except Exception:
+                with self.lock:
+                    if sock is self.sock:
+                        self._reset_locked()
+                return
+
+    def _reset_locked(self) -> None:
+        sock, self.sock = self.sock, None
+        self.conn = None
+        if sock is not None:
+            self._close_socket(sock)
+
+    def _close_socket(self, sock: ssl.SSLSocket) -> None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+class RawH2TakePool:
+    def __init__(self, cookie: str, size: int, timeout: float = 30) -> None:
+        self.size = size
+        self.lock = Lock()
+        self.next_index = 0
+        self.connections = [RawH2TakeConnection(cookie, timeout) for _ in range(size)]
+
+    def open(self) -> None:
+        for connection in self.connections:
+            try:
+                connection.open()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        for connection in self.connections:
+            connection.close()
+
+    def take_payment_sent(self, order_id: str) -> TakeHTTPResult:
+        with self.lock:
+            connection = self.connections[self.next_index % self.size]
+            self.next_index += 1
+        return connection.send_take(order_id)
+
+    def take_payment_burst_sent(self, order_id: str, attempts: int) -> list[TakeHTTPResult]:
+        return [self.take_payment_sent(order_id) for _ in range(attempts)]

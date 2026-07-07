@@ -17,7 +17,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from cryptobot_api import CryptoBotAPI, TakeHTTPResult
+from cryptobot_api import CryptoBotAPI, RawH2TakePool, TakeHTTPResult
 from cryptobot_socket import CryptoBotSocketClient
 from runtime_config import env, load_env_file
 
@@ -108,14 +108,26 @@ class TakeCandidate:
 
 class TakePool:
     def __init__(self, cookie: str, wait_take_response: bool, size: int) -> None:
-        self.api = CryptoBotAPI(cookie, wait_take_response=wait_take_response, max_connections=size)
-        self.api.open()
-        self.api.preconnect()
+        self.api: CryptoBotAPI | None = None
+        self.raw: RawH2TakePool | None = None
+        if wait_take_response:
+            self.api = CryptoBotAPI(cookie, wait_take_response=True, max_connections=size)
+            self.api.open()
+            self.api.preconnect()
+        else:
+            self.raw = RawH2TakePool(cookie, size)
+            self.raw.open()
 
     def take(self, order_id: str) -> TakeHTTPResult:
+        if self.raw is not None:
+            return self.raw.take_payment_sent(order_id)
+        if self.api is None:
+            raise RuntimeError("take pool is not initialized")
         return self.api.take_payment_timed(order_id)
 
     def take_burst(self, order_id: str, attempts: int) -> list[TakeHTTPResult]:
+        if self.raw is not None:
+            return self.raw.take_payment_burst_sent(order_id, attempts)
         if attempts == 1:
             return [self.take(order_id)]
         results: list[TakeHTTPResult | None] = [None] * attempts
@@ -131,7 +143,10 @@ class TakePool:
         return [result for result in results if result is not None]
 
     def close(self) -> None:
-        self.api.close()
+        if self.api is not None:
+            self.api.close()
+        if self.raw is not None:
+            self.raw.close()
 
 
 class TakeRateLimiter:
@@ -276,8 +291,15 @@ class ParallelTaker:
         order_id = str(candidate.order.get("id", ""))
         take_started_at = perf_counter_ns()
         responses = self.take_pool.take_burst(order_id, candidate.attempts)
-        take_finished_at = perf_counter_ns()
+        take_finished_at = max((response.finished_ns for response in responses), default=perf_counter_ns())
         ok = any(response.error is None for response in responses)
+        request_timing_name = "take" if self.wait_take_response else "send"
+        timing_ms = {
+            "queue": round((take_started_at - candidate.queued_ns) / 1_000_000, 3),
+            "decision": round((candidate.queued_ns - candidate.received_ns) / 1_000_000, 3),
+            request_timing_name: round((take_finished_at - take_started_at) / 1_000_000, 3),
+            "total": round((take_finished_at - candidate.received_ns) / 1_000_000, 3),
+        }
         result = {
             "received_at": datetime.now(timezone.utc).isoformat(),
             "worker_id": candidate.worker_id,
@@ -286,12 +308,7 @@ class ParallelTaker:
             "order": candidate.order,
             "ws_edge_headers": candidate.ws_edge_headers,
             "take_attempts": candidate.attempts,
-            "timing_ms": {
-                "queue": round((take_started_at - candidate.queued_ns) / 1_000_000, 3),
-                "decision": round((candidate.queued_ns - candidate.received_ns) / 1_000_000, 3),
-                "take": round((take_finished_at - take_started_at) / 1_000_000, 3),
-                "total": round((take_finished_at - candidate.received_ns) / 1_000_000, 3),
-            },
+            "timing_ms": timing_ms,
             "take_responses": [self._response_record(response) for response in responses],
         }
         append_record(SAVE_PATH, result, self.file_lock)
@@ -299,7 +316,7 @@ class ParallelTaker:
             f"worker={candidate.worker_id} take_worker={take_worker_id} take {'ok' if ok else 'failed'} "
             f"id={order_id} amount={candidate.amount} attempts={candidate.attempts} "
             f"queue={ms(take_started_at - candidate.queued_ns)} decision={ms(candidate.queued_ns - candidate.received_ns)} "
-            f"take={ms(take_finished_at - take_started_at)} total={ms(take_finished_at - candidate.received_ns)}",
+            f"{request_timing_name}={ms(take_finished_at - take_started_at)} total={ms(take_finished_at - candidate.received_ns)}",
             flush=True,
         )
         for response in responses:
@@ -309,17 +326,25 @@ class ParallelTaker:
                 print(f"take response id={order_id} status={response.status_code} error={short_text(response.error)}", flush=True)
 
     def _response_record(self, response: TakeHTTPResult) -> dict[str, Any]:
+        timing = (
+            {
+                "send": round((response.finished_ns - response.started_ns) / 1_000_000, 3),
+                "total": round((response.finished_ns - response.started_ns) / 1_000_000, 3),
+            }
+            if response.headers.get("mode") == "raw-h2"
+            else {
+                "headers": round((response.headers_ns - response.started_ns) / 1_000_000, 3),
+                "body": round((response.finished_ns - response.headers_ns) / 1_000_000, 3),
+                "total": round((response.finished_ns - response.started_ns) / 1_000_000, 3),
+            }
+        )
         return {
             "status_code": response.status_code,
             "headers": response.headers,
             "error": response.error,
             "response_json": response.response_json,
             "response_text": short_text(response.response_text) if response.response_text and response.response_json is None else "",
-            "timing_ms": {
-                "headers": round((response.headers_ns - response.started_ns) / 1_000_000, 3),
-                "body": round((response.finished_ns - response.headers_ns) / 1_000_000, 3),
-                "total": round((response.finished_ns - response.started_ns) / 1_000_000, 3),
-            },
+            "timing_ms": timing,
         }
 
 
