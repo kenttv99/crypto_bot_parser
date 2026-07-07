@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
-from time import perf_counter_ns, sleep
+from time import perf_counter_ns, sleep, time_ns
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,12 +95,32 @@ def ms(ns: int) -> str:
     return f"{ns / 1_000_000:.3f}ms"
 
 
+def order_created_ns(order_id: str) -> int | None:
+    if len(order_id) < 8:
+        return None
+    try:
+        return int(order_id[:8], 16) * 1_000_000_000
+    except ValueError:
+        return None
+
+
+def age_ms(now_ns: int, created_ns: int | None) -> float | None:
+    return round((now_ns - created_ns) / 1_000_000, 3) if created_ns is not None else None
+
+
+def age_text(now_ns: int, created_ns: int | None) -> str:
+    value = age_ms(now_ns, created_ns)
+    return "unknown" if value is None else f"{value:.3f}ms"
+
+
 @dataclass(slots=True)
 class TakeCandidate:
     worker_id: int
     order: dict[str, Any]
     amount: str
     attempts: int
+    created_ns: int | None
+    received_wall_ns: int
     received_ns: int
     queued_ns: int
     ws_edge_headers: dict[str, str]
@@ -281,16 +301,18 @@ class ParallelTaker:
             if record.get("type") != "socketio_event":
                 return None
             received_at = perf_counter_ns()
+            received_wall_at = time_ns()
             for order in extract_candidates(record):
-                self._try_enqueue(worker_id, order, received_at, ws_edge_headers)
+                self._try_enqueue(worker_id, order, received_at, received_wall_at, ws_edge_headers)
             return None
 
         return on_record
 
-    def _try_enqueue(self, worker_id: int, order: dict[str, Any], received_at: int, ws_edge_headers: dict[str, str]) -> None:
+    def _try_enqueue(self, worker_id: int, order: dict[str, Any], received_at: int, received_wall_at: int, ws_edge_headers: dict[str, str]) -> None:
         order_id = str(order.get("id", ""))
         if not order_id:
             return
+        created_at = order_created_ns(order_id)
         with self.seen_lock:
             if order_id in self.seen_ids:
                 return
@@ -313,16 +335,19 @@ class ParallelTaker:
         if allowed_attempts < 1:
             print(f"worker={worker_id} skip order id={order_id} amount={raw_amount} reason=take_rate_limit", flush=True)
             return
-        self.queue.put(TakeCandidate(worker_id, order, raw_amount, allowed_attempts, received_at, perf_counter_ns(), ws_edge_headers))
+        self.queue.put(TakeCandidate(worker_id, order, raw_amount, allowed_attempts, created_at, received_wall_at, received_at, perf_counter_ns(), ws_edge_headers))
 
     def _take_candidate(self, take_worker_id: int, candidate: TakeCandidate) -> None:
         order_id = str(candidate.order.get("id", ""))
         take_started_at = perf_counter_ns()
+        take_started_wall_at = time_ns()
         responses = self.take_pool.take_burst(order_id, candidate.attempts)
         take_finished_at = max((response.finished_ns for response in responses), default=perf_counter_ns())
         ok = any(response.error is None for response in responses)
         request_timing_name = "take" if self.wait_take_response else "send"
         timing_ms = {
+            "age_receive": age_ms(candidate.received_wall_ns, candidate.created_ns),
+            "age_send_start": age_ms(take_started_wall_at, candidate.created_ns),
             "queue": round((take_started_at - candidate.queued_ns) / 1_000_000, 3),
             "decision": round((candidate.queued_ns - candidate.received_ns) / 1_000_000, 3),
             request_timing_name: round((take_finished_at - take_started_at) / 1_000_000, 3),
@@ -344,6 +369,8 @@ class ParallelTaker:
         print(
             f"worker={candidate.worker_id} take_worker={take_worker_id} {action} {'ok' if ok else 'failed'} "
             f"id={order_id} amount={candidate.amount} attempts={candidate.attempts} "
+            f"age_receive={age_text(candidate.received_wall_ns, candidate.created_ns)} "
+            f"age_send={age_text(take_started_wall_at, candidate.created_ns)} "
             f"queue={ms(take_started_at - candidate.queued_ns)} decision={ms(candidate.queued_ns - candidate.received_ns)} "
             f"{request_timing_name}={ms(take_finished_at - take_started_at)} total={ms(take_finished_at - candidate.received_ns)}",
             flush=True,
