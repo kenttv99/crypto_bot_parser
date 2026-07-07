@@ -8,7 +8,7 @@ import ssl
 from collections import deque
 from dataclasses import dataclass, field
 from threading import Lock, Thread
-from time import perf_counter_ns
+from time import perf_counter_ns, sleep
 from typing import Any
 from urllib.parse import urlparse
 
@@ -188,6 +188,7 @@ class RawH2TakeConnection:
         self.sock: ssl.SSLSocket | None = None
         self.conn: H2Connection | None = None
         self.reader: Thread | None = None
+        self.reconnecting = False
         self.pending: dict[int, dict[str, Any]] = {}
         self.events: deque[RawH2ResponseEvent] = deque(maxlen=1024)
 
@@ -230,6 +231,7 @@ class RawH2TakeConnection:
                 error = str(exc)
                 with self.lock:
                     self._reset_locked()
+                    self._start_reconnect_locked()
                 continue
         finished_ns = perf_counter_ns()
         return TakeHTTPResult(None, None, "", {"mode": "raw-h2", "connection_id": str(self.connection_id)}, error, started_ns, finished_ns, finished_ns)
@@ -251,6 +253,13 @@ class RawH2TakeConnection:
     def _connect_locked(self) -> None:
         if self.closed:
             raise RuntimeError("raw h2 connection pool is closed")
+        sock, conn = self._new_connection()
+        self.sock = sock
+        self.conn = conn
+        self.reader = Thread(target=self._read_loop, daemon=True)
+        self.reader.start()
+
+    def _new_connection(self) -> tuple[ssl.SSLSocket, H2Connection]:
         parsed = urlparse(BASE_URL)
         host = parsed.hostname or "app.send.tg"
         raw = socket.create_connection((host, parsed.port or 443), timeout=self.timeout)
@@ -268,10 +277,7 @@ class RawH2TakeConnection:
         conn = H2Connection(config=H2Configuration(client_side=True, header_encoding="utf-8"))
         conn.initiate_connection()
         sock.sendall(conn.data_to_send())
-        self.sock = sock
-        self.conn = conn
-        self.reader = Thread(target=self._read_loop, daemon=True)
-        self.reader.start()
+        return sock, conn
 
     def _read_loop(self) -> None:
         while True:
@@ -298,6 +304,7 @@ class RawH2TakeConnection:
                 with self.lock:
                     if sock is self.sock:
                         self._reset_locked()
+                        self._start_reconnect_locked()
                 return
 
     def _reset_locked(self) -> None:
@@ -309,6 +316,42 @@ class RawH2TakeConnection:
         self.pending.clear()
         if sock is not None:
             self._close_socket(sock)
+
+    def _start_reconnect_locked(self) -> None:
+        if self.closed or self.reconnecting:
+            return
+        self.reconnecting = True
+        Thread(target=self._reconnect_loop, daemon=True).start()
+
+    def _reconnect_loop(self) -> None:
+        while True:
+            with self.lock:
+                if self.closed:
+                    self.reconnecting = False
+                    return
+                if self.sock is not None and self.conn is not None:
+                    self.reconnecting = False
+                    return
+            try:
+                sock, conn = self._new_connection()
+            except Exception:
+                sleep(0.05)
+                continue
+            with self.lock:
+                if self.closed or self.sock is not None or self.conn is not None:
+                    self._close_socket(sock)
+                    self.reconnecting = False
+                    return
+                self.sock = sock
+                self.conn = conn
+                self.reader = Thread(target=self._read_loop, daemon=True)
+                self.reader.start()
+                self.reconnecting = False
+                return
+
+    def ready(self) -> bool:
+        with self.lock:
+            return self.sock is not None and self.conn is not None
 
     def pop_events(self) -> list[RawH2ResponseEvent]:
         with self.lock:
@@ -412,9 +455,7 @@ class RawH2TakePool:
             connection.close()
 
     def take_payment_sent(self, order_id: str) -> TakeHTTPResult:
-        with self.lock:
-            connection = self.connections[self.next_index % self.size]
-            self.next_index += 1
+        connection = self._next_ready_connection()
         return connection.send_take(order_id)
 
     def take_payment_burst_sent(self, order_id: str, attempts: int) -> list[TakeHTTPResult]:
@@ -425,3 +466,16 @@ class RawH2TakePool:
         for connection in self.connections:
             events.extend(connection.pop_events())
         return events
+
+    def _next_ready_connection(self) -> RawH2TakeConnection:
+        with self.lock:
+            start = self.next_index
+            for offset in range(self.size):
+                index = (start + offset) % self.size
+                connection = self.connections[index]
+                if connection.ready():
+                    self.next_index = index + 1
+                    return connection
+            connection = self.connections[self.next_index % self.size]
+            self.next_index += 1
+            return connection
