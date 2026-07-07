@@ -91,6 +91,12 @@ class CryptoBotSocketClient:
             return
         received_perf_ns = perf_counter_ns()
         received_wall_ns = time_ns()
+        fast_record = self._fast_record(message, received_perf_ns, received_wall_ns)
+        fast_result = on_record(fast_record) if fast_record is not None and on_record is not None else None
+        if fast_result is False:
+            return False
+        if fast_record is not None and not self.save_json_path:
+            return None
         parsed = self._parse_message(message)
         parsed["received_perf_ns"] = received_perf_ns
         parsed["received_wall_ns"] = received_wall_ns
@@ -99,11 +105,25 @@ class CryptoBotSocketClient:
             self.initialized = True
         if parsed["type"] == "ping":
             conn.sendall(self._ws_frame("3"))
-        result = on_record(parsed) if on_record is not None else None
+        result = None if fast_record is not None else on_record(parsed) if on_record is not None else None
         self._append_json(parsed)
         if result is False:
             return False
         return None
+
+    def _fast_record(self, message: str, received_perf_ns: int, received_wall_ns: int) -> dict[str, Any] | None:
+        fast_orders = self._fast_orders(message)
+        if not fast_orders:
+            return None
+        return {
+            "received_at": self._now(),
+            "received_perf_ns": received_perf_ns,
+            "received_wall_ns": received_wall_ns,
+            "type": "socketio_event",
+            "event": "list:update",
+            "fast_orders": fast_orders,
+            "raw": message,
+        }
 
     def _parse_message(self, message: str) -> dict[str, Any]:
         if message.startswith("0{"):
@@ -121,7 +141,11 @@ class CryptoBotSocketClient:
             return {"received_at": self._now(), "type": "socketio_error", "payload": json.loads(message[2:]), "raw": message}
         if message.startswith("42"):
             event, payload = self._parse_socketio_event(message)
-            return {"received_at": self._now(), "type": "socketio_event", "event": event, "payload": payload, "raw": message}
+            record = {"received_at": self._now(), "type": "socketio_event", "event": event, "payload": payload, "raw": message}
+            fast_orders = self._fast_orders(message)
+            if fast_orders:
+                record["fast_orders"] = fast_orders
+            return record
         return {"received_at": self._now(), "type": "raw", "raw": message}
 
     def _parse_socketio_event(self, message: str) -> tuple[str, Any]:
@@ -129,6 +153,74 @@ class CryptoBotSocketClient:
         if isinstance(payload, list) and payload:
             return str(payload[0]), payload[1] if len(payload) == 2 else payload[1:]
         return "message", payload
+
+    def _fast_orders(self, message: str) -> list[dict[str, str]]:
+        if not message.startswith('42["list:update"') or '"op":"add"' not in message:
+            return []
+        orders: list[dict[str, str]] = []
+        start = 0
+        while True:
+            marker = message.find('"op":"add"', start)
+            if marker < 0:
+                return orders
+            data_marker = message.find('"data":{', marker)
+            if data_marker < 0:
+                start = marker + 8
+                continue
+            end = self._object_end(message, data_marker + 7)
+            if end < 0:
+                start = data_marker + 7
+                continue
+            chunk = message[data_marker:end]
+            order_id = self._json_string_field(chunk, "id")
+            amount = self._json_string_field(chunk, "in_amount")
+            if order_id and amount:
+                orders.append({"id": order_id, "in_amount": amount})
+            start = end
+
+    def _object_end(self, text: str, start: int) -> int:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+        return -1
+
+    def _json_string_field(self, text: str, name: str) -> str:
+        marker = f'"{name}":"'
+        start = text.find(marker)
+        if start < 0:
+            return ""
+        start += len(marker)
+        value = []
+        escaped = False
+        for char in text[start:]:
+            if escaped:
+                value.append(char)
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                return "".join(value)
+            else:
+                value.append(char)
+        return ""
 
     def _parse_upgrade_headers(self, response: bytes) -> dict[str, str]:
         headers: dict[str, str] = {}

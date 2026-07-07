@@ -79,6 +79,15 @@ def extract_candidates(record: dict[str, Any]):
             yield item["data"]
 
 
+def extract_fast_candidates(record: dict[str, Any]):
+    if record.get("type") == "socketio_event" and record.get("event") == "list:update":
+        payload = record.get("fast_orders")
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    yield item
+
+
 def append_record(path: Path, record: dict[str, Any], lock: Lock) -> None:
     with lock:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -339,7 +348,8 @@ class ParallelTaker:
                 return None
             received_at = int(record.get("received_perf_ns") or perf_counter_ns())
             received_wall_at = int(record.get("received_wall_ns") or time_ns())
-            for order in extract_candidates(record):
+            candidates = extract_candidates(record) if self.wait_take_response else extract_fast_candidates(record)
+            for order in candidates:
                 self._try_enqueue(worker_id, order, received_at, received_wall_at, ws_edge_headers)
             return None
 
