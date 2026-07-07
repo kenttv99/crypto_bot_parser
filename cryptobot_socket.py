@@ -70,7 +70,7 @@ class CryptoBotSocketClient:
             f"Sec-WebSocket-Key: {key}",
         ]
         conn.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
-        response = conn.recv(4096)
+        response = self._read_http_headers(conn)
         self.edge_headers = self._parse_upgrade_headers(response)
         if b" 101 " not in response:
             raise RuntimeError("websocket upgrade failed")
@@ -81,7 +81,7 @@ class CryptoBotSocketClient:
         if opcode == 8:
             return None
         if opcode == 9:
-            conn.sendall(self._ws_frame("3"))
+            conn.sendall(self._frame(payload, 10))
             return ""
         return payload.decode("utf-8", "replace") if opcode == 1 else ""
 
@@ -154,27 +154,50 @@ class CryptoBotSocketClient:
         path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _read_frame(self, conn: ssl.SSLSocket) -> tuple[int, bytes]:
-        first = conn.recv(2)
-        if len(first) < 2:
+        first = self._recv_exact(conn, 2)
+        if first is None:
             return 8, b""
         b1, b2 = first
         opcode = b1 & 0x0F
         masked = b2 & 0x80
         length = b2 & 0x7F
         if length == 126:
-            length = struct.unpack("!H", conn.recv(2))[0]
+            extended = self._recv_exact(conn, 2)
+            if extended is None:
+                return 8, b""
+            length = struct.unpack("!H", extended)[0]
         elif length == 127:
-            length = struct.unpack("!Q", conn.recv(8))[0]
-        mask = conn.recv(4) if masked else b""
-        payload = b""
-        while len(payload) < length:
-            chunk = conn.recv(length - len(payload))
-            if not chunk:
-                break
-            payload += chunk
+            extended = self._recv_exact(conn, 8)
+            if extended is None:
+                return 8, b""
+            length = struct.unpack("!Q", extended)[0]
+        mask = self._recv_exact(conn, 4) if masked else b""
+        payload = self._recv_exact(conn, length)
+        if payload is None:
+            return 8, b""
         if masked and mask:
             payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
         return opcode, payload
+
+    def _read_http_headers(self, conn: ssl.SSLSocket) -> bytes:
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+            if len(response) > 65536:
+                raise RuntimeError("websocket upgrade response too large")
+        return bytes(response)
+
+    def _recv_exact(self, conn: ssl.SSLSocket, size: int) -> bytes | None:
+        data = bytearray()
+        while len(data) < size:
+            chunk = conn.recv(size - len(data))
+            if not chunk:
+                return None
+            data.extend(chunk)
+        return bytes(data)
 
     def _ws_frame(self, payload: str) -> bytes:
         return self._frame(payload.encode("utf-8"), 1)

@@ -68,8 +68,9 @@ def main() -> None:
     ensure_limits(min_limit, max_limit)
     wait_take_response = env_bool("WAIT_TAKE_RESPONSE", True)
     started_at = perf_counter_ns()
-    api = CryptoBotAPI(cookie, wait_take_response=wait_take_response, preconnect_after_send=not wait_take_response)
+    api = CryptoBotAPI(cookie, wait_take_response=wait_take_response)
     api.open()
+    api.preconnect()
     seen_ids: set[str] = set()
 
     def on_record(record: dict[str, Any]) -> bool | None:

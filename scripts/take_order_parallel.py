@@ -5,9 +5,11 @@ import json
 import os
 import sys
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from time import perf_counter_ns, sleep
 from typing import Any
@@ -15,7 +17,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from cryptobot_api import CryptoBotAPI
+from cryptobot_api import CryptoBotAPI, TakeHTTPResult
 from cryptobot_socket import CryptoBotSocketClient
 from runtime_config import env, load_env_file
 
@@ -93,36 +95,40 @@ def ms(ns: int) -> str:
     return f"{ns / 1_000_000:.3f}ms"
 
 
+@dataclass(slots=True)
+class TakeCandidate:
+    worker_id: int
+    order: dict[str, Any]
+    amount: str
+    attempts: int
+    received_ns: int
+    queued_ns: int
+    ws_edge_headers: dict[str, str]
+
+
 class TakePool:
     def __init__(self, cookie: str, wait_take_response: bool, size: int) -> None:
         self.api = CryptoBotAPI(cookie, wait_take_response=wait_take_response, max_connections=size)
         self.api.open()
+        self.api.preconnect()
 
-    def take(self, order_id: str) -> dict[str, Any] | None:
-        return self.api.take_payment(order_id)
+    def take(self, order_id: str) -> TakeHTTPResult:
+        return self.api.take_payment_timed(order_id)
 
-    def take_burst(self, order_id: str, attempts: int) -> list[dict[str, Any] | None]:
+    def take_burst(self, order_id: str, attempts: int) -> list[TakeHTTPResult]:
         if attempts == 1:
             return [self.take(order_id)]
-        results: list[dict[str, Any] | None] = [None] * attempts
-        errors: list[BaseException] = []
-        error_lock = Lock()
+        results: list[TakeHTTPResult | None] = [None] * attempts
 
         def run(index: int) -> None:
-            try:
-                results[index] = self.take(order_id)
-            except BaseException as exc:
-                with error_lock:
-                    errors.append(exc)
+            results[index] = self.take(order_id)
 
         threads = [Thread(target=run, args=(index,), daemon=True) for index in range(attempts)]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
-        if len(errors) == attempts:
-            raise RuntimeError(short_text(str(errors[0])))
-        return results
+        return [result for result in results if result is not None]
 
     def close(self) -> None:
         self.api.close()
@@ -179,10 +185,24 @@ class ParallelTaker:
         self.take_attempts = take_attempts
         self.rate_limiter = rate_limiter
         self.log_skips = log_skips
+        self.queue: Queue[TakeCandidate] = Queue()
         self.seen_ids: set[str] = set()
         self.seen_lock = Lock()
         self.file_lock = Lock()
         self.stop_event = Event()
+
+    def run_take_worker(self, take_worker_id: int) -> None:
+        while not self.stop_event.is_set():
+            try:
+                candidate = self.queue.get(timeout=0.2)
+            except Empty:
+                continue
+            try:
+                self._take_candidate(take_worker_id, candidate)
+            except Exception as exc:
+                print(f"take_worker={take_worker_id} error={short_text(str(exc))}", flush=True)
+            finally:
+                self.queue.task_done()
 
     def run_worker(self, worker_id: int) -> None:
         reconnects = 0
@@ -200,7 +220,10 @@ class ParallelTaker:
                 sleep(self.reconnect_delay)
 
     def _handler(self, worker_id: int):
+        ws_edge_headers: dict[str, str] = {}
+
         def on_record(record: dict[str, Any]) -> bool | None:
+            nonlocal ws_edge_headers
             if self.stop_event.is_set():
                 return False
             if record.get("type") == "socketio_connect":
@@ -210,17 +233,18 @@ class ParallelTaker:
                 cf_ray = edge_headers.get("cf-ray", "") if isinstance(edge_headers, dict) else ""
                 cf_colo = edge_headers.get("cf-colo", "") if isinstance(edge_headers, dict) else ""
                 print(f"worker={worker_id} socket connected sid={sid} cf_ray={cf_ray} colo={cf_colo}", flush=True)
+                ws_edge_headers = edge_headers if isinstance(edge_headers, dict) else {}
                 return None
             if record.get("type") != "socketio_event":
                 return None
             received_at = perf_counter_ns()
             for order in extract_candidates(record):
-                self._try_take(worker_id, order, received_at)
+                self._try_enqueue(worker_id, order, received_at, ws_edge_headers)
             return None
 
         return on_record
 
-    def _try_take(self, worker_id: int, order: dict[str, Any], received_at: int) -> None:
+    def _try_enqueue(self, worker_id: int, order: dict[str, Any], received_at: int, ws_edge_headers: dict[str, str]) -> None:
         order_id = str(order.get("id", ""))
         if not order_id:
             return
@@ -246,42 +270,64 @@ class ParallelTaker:
         if allowed_attempts < 1:
             print(f"worker={worker_id} skip order id={order_id} amount={raw_amount} reason=take_rate_limit", flush=True)
             return
+        self.queue.put(TakeCandidate(worker_id, order, raw_amount, allowed_attempts, received_at, perf_counter_ns(), ws_edge_headers))
+
+    def _take_candidate(self, take_worker_id: int, candidate: TakeCandidate) -> None:
+        order_id = str(candidate.order.get("id", ""))
         take_started_at = perf_counter_ns()
-        try:
-            responses = self.take_pool.take_burst(order_id, allowed_attempts)
-        except RuntimeError as exc:
-            take_finished_at = perf_counter_ns()
-            print(
-                f"worker={worker_id} take failed id={order_id} amount={raw_amount} "
-                f"decision={ms(take_started_at - received_at)} take={ms(take_finished_at - take_started_at)} error={short_text(str(exc))}",
-                flush=True,
-            )
-            return
+        responses = self.take_pool.take_burst(order_id, candidate.attempts)
         take_finished_at = perf_counter_ns()
+        ok = any(response.error is None for response in responses)
         result = {
             "received_at": datetime.now(timezone.utc).isoformat(),
-            "worker_id": worker_id,
-            "type": "taken_order" if any(response is not None for response in responses) else "take_request_sent",
-            "order": order,
-            "take_responses": responses,
-            "take_attempts": allowed_attempts,
+            "worker_id": candidate.worker_id,
+            "take_worker_id": take_worker_id,
+            "type": "taken_order" if ok and self.wait_take_response else "take_request_sent" if ok else "take_failed",
+            "order": candidate.order,
+            "ws_edge_headers": candidate.ws_edge_headers,
+            "take_attempts": candidate.attempts,
+            "timing_ms": {
+                "queue": round((take_started_at - candidate.queued_ns) / 1_000_000, 3),
+                "decision": round((candidate.queued_ns - candidate.received_ns) / 1_000_000, 3),
+                "take": round((take_finished_at - take_started_at) / 1_000_000, 3),
+                "total": round((take_finished_at - candidate.received_ns) / 1_000_000, 3),
+            },
+            "take_responses": [self._response_record(response) for response in responses],
         }
         append_record(SAVE_PATH, result, self.file_lock)
         print(
-            f"worker={worker_id} take {'order' if any(response is not None for response in responses) else 'request sent'} "
-            f"id={order_id} amount={raw_amount} attempts={allowed_attempts} "
-            f"decision={ms(take_started_at - received_at)} take={ms(take_finished_at - take_started_at)} total={ms(take_finished_at - received_at)}",
+            f"worker={candidate.worker_id} take_worker={take_worker_id} take {'ok' if ok else 'failed'} "
+            f"id={order_id} amount={candidate.amount} attempts={candidate.attempts} "
+            f"queue={ms(take_started_at - candidate.queued_ns)} decision={ms(candidate.queued_ns - candidate.received_ns)} "
+            f"take={ms(take_finished_at - take_started_at)} total={ms(take_finished_at - candidate.received_ns)}",
             flush=True,
         )
         for response in responses:
-            if response is not None:
-                print(json.dumps(response, ensure_ascii=False, indent=2), flush=True)
+            if response.response_json is not None:
+                print(json.dumps(response.response_json, ensure_ascii=False, indent=2), flush=True)
+            elif response.error:
+                print(f"take response id={order_id} status={response.status_code} error={short_text(response.error)}", flush=True)
+
+    def _response_record(self, response: TakeHTTPResult) -> dict[str, Any]:
+        return {
+            "status_code": response.status_code,
+            "headers": response.headers,
+            "error": response.error,
+            "response_json": response.response_json,
+            "response_text": short_text(response.response_text) if response.response_text and response.response_json is None else "",
+            "timing_ms": {
+                "headers": round((response.headers_ns - response.started_ns) / 1_000_000, 3),
+                "body": round((response.finished_ns - response.headers_ns) / 1_000_000, 3),
+                "total": round((response.finished_ns - response.started_ns) / 1_000_000, 3),
+            },
+        }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--connections", "-c", type=int, default=3, help="parallel websocket connections")
     parser.add_argument("--take-pool-size", type=int, default=16, help="preconnected HTTPS take connections")
+    parser.add_argument("--take-workers", type=int, default=4, help="parallel order take workers")
     parser.add_argument("--take-attempts", type=int, default=1, help="parallel take POST requests per matching order")
     parser.add_argument("--socket-timeout", type=int, default=120, help="websocket socket timeout seconds")
     parser.add_argument("--reconnect-delay", type=float, default=0.2, help="delay before reconnect seconds")
@@ -292,6 +338,8 @@ def main() -> None:
         parser.error("--connections must be greater than 0")
     if args.take_pool_size < 1:
         parser.error("--take-pool-size must be greater than 0")
+    if args.take_workers < 1:
+        parser.error("--take-workers must be greater than 0")
     if args.take_attempts < 1:
         parser.error("--take-attempts must be greater than 0")
     if args.take_attempts > args.take_pool_size:
@@ -326,8 +374,11 @@ def main() -> None:
         rate_limiter,
         args.log_skips,
     )
+    take_threads = [Thread(target=taker.run_take_worker, args=(worker_id,), daemon=True) for worker_id in range(1, args.take_workers + 1)]
     threads = [Thread(target=taker.run_worker, args=(worker_id,), daemon=False) for worker_id in range(1, args.connections + 1)]
     try:
+        for thread in take_threads:
+            thread.start()
         for thread in threads:
             thread.start()
             sleep(args.start_delay)

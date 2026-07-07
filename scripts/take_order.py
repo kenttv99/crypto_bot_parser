@@ -88,6 +88,7 @@ def main() -> None:
     wait_take_response = env_bool("WAIT_TAKE_RESPONSE", True)
     api = CryptoBotAPI(cookie, wait_take_response=wait_take_response)
     api.open()
+    api.preconnect()
     seen_ids: set[str] = set()
 
     def on_record(record: dict[str, Any]) -> bool | None:

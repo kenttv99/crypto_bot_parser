@@ -4,6 +4,7 @@ import random
 import secrets
 from dataclasses import dataclass, field
 from threading import Lock
+from time import perf_counter_ns
 from typing import Any
 
 import httpx
@@ -17,6 +18,18 @@ SENTRY_PUBLIC_KEY = "abd78de7be54ff3fb9f6b677ba8c3ae6"
 
 
 @dataclass(slots=True)
+class TakeHTTPResult:
+    status_code: int | None
+    response_json: dict[str, Any] | None
+    response_text: str
+    headers: dict[str, str]
+    error: str | None
+    started_ns: int
+    headers_ns: int
+    finished_ns: int
+
+
+@dataclass(slots=True)
 class CryptoBotAPI:
     cookie: str
     timeout: float = 30
@@ -27,6 +40,9 @@ class CryptoBotAPI:
 
     def open(self) -> None:
         self._ensure_client()
+
+    def preconnect(self) -> None:
+        self.get_onboarding_state()
 
     def close(self) -> None:
         with self._client_lock:
@@ -45,6 +61,25 @@ class CryptoBotAPI:
             return None
         return self._request_json("POST", path, baggage=baggage, sentry_trace=sentry_trace)
 
+    def take_payment_timed(self, order_id: str) -> TakeHTTPResult:
+        started_ns = perf_counter_ns()
+        response: httpx.Response | None = None
+        try:
+            response = self._send("POST", f"/internal/v1/p2c/payments/take/{order_id}", stream=True)
+            headers_ns = perf_counter_ns()
+            body = response.read() if self.wait_take_response else b""
+            finished_ns = perf_counter_ns()
+            text = body.decode(response.encoding or "utf-8", "replace") if body else ""
+            parsed = self._parse_json(response) if body and self._is_json(response) else None
+            error = None if 200 <= response.status_code < 300 else text or f"HTTP {response.status_code}"
+            return TakeHTTPResult(response.status_code, parsed, text, self._telemetry_headers(response), error, started_ns, headers_ns, finished_ns)
+        except Exception as exc:
+            finished_ns = perf_counter_ns()
+            return TakeHTTPResult(None, None, "", {}, str(exc), started_ns, finished_ns, finished_ns)
+        finally:
+            if response is not None:
+                response.close()
+
     def _request_json(self, method: str, path: str, baggage: str | None = None, sentry_trace: str | None = None) -> dict[str, Any]:
         response = self._ensure_client().request(method, path, content=b"" if method == "POST" else None, headers=self._headers(baggage, sentry_trace))
         if 200 <= response.status_code < 300:
@@ -55,6 +90,11 @@ class CryptoBotAPI:
         request = self._ensure_client().build_request(method, path, content=b"" if method == "POST" else None, headers=self._headers(baggage, sentry_trace))
         response = self._ensure_client().send(request, stream=True)
         response.close()
+
+    def _send(self, method: str, path: str, stream: bool) -> httpx.Response:
+        baggage, sentry_trace = self._sentry_headers()
+        request = self._ensure_client().build_request(method, path, content=b"" if method == "POST" else None, headers=self._headers(baggage, sentry_trace))
+        return self._ensure_client().send(request, stream=stream)
 
     def _ensure_client(self) -> httpx.Client:
         with self._client_lock:
@@ -88,6 +128,23 @@ class CryptoBotAPI:
         if sentry_trace:
             headers["sentry-trace"] = sentry_trace
         return headers
+
+    def _telemetry_headers(self, response: httpx.Response) -> dict[str, str]:
+        headers = {name: response.headers[name] for name in ("cf-ray", "server", "content-type") if name in response.headers}
+        cf_ray = headers.get("cf-ray", "")
+        if "-" in cf_ray:
+            headers["cf-colo"] = cf_ray.rsplit("-", 1)[1]
+        return headers
+
+    def _is_json(self, response: httpx.Response) -> bool:
+        return "application/json" in response.headers.get("content-type", "")
+
+    def _parse_json(self, response: httpx.Response) -> dict[str, Any] | None:
+        try:
+            parsed = response.json()
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else {"data": parsed}
 
     def _sentry_headers(self) -> tuple[str, str]:
         trace_id = secrets.token_hex(16)
