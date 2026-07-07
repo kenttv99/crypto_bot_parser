@@ -253,7 +253,7 @@ class ParallelTaker:
         self.rate_limiter = rate_limiter
         self.log_skips = log_skips
         self.queue: Queue[TakeCandidate] = Queue()
-        self.seen_ids: set[str] = set()
+        self.seen_ids: dict[str, tuple[int, int]] = {}
         self.seen_lock = Lock()
         self.file_lock = Lock()
         self.stop_event = Event()
@@ -289,9 +289,10 @@ class ParallelTaker:
                     },
                 }
                 append_record(SAVE_PATH, record, self.file_lock)
+                response_after_send = round((event.received_ns - event.sent_ns) / 1_000_000, 3) if event.sent_ns else None
                 print(
                     f"raw_h2 response id={event.order_id} stream={event.stream_id} "
-                    f"status={event.status_code} error={short_text(event.error or '')}",
+                    f"status={event.status_code} response_after_send={response_after_send}ms error={short_text(event.error or '')}",
                     flush=True,
                 )
             sleep(0.05)
@@ -350,9 +351,13 @@ class ParallelTaker:
             return
         created_at = order_created_ns(order_id)
         with self.seen_lock:
-            if order_id in self.seen_ids:
+            seen = self.seen_ids.get(order_id)
+            if seen is not None:
+                first_worker, first_seen_ns = seen
+                if self.log_skips:
+                    print(f"worker={worker_id} duplicate id={order_id} first_worker={first_worker} lag={ms(received_at - first_seen_ns)}", flush=True)
                 return
-            self.seen_ids.add(order_id)
+            self.seen_ids[order_id] = (worker_id, received_at)
         raw_amount = str(order.get("in_amount", "")).strip()
         if not raw_amount:
             if self.log_skips:
