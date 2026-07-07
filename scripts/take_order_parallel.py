@@ -148,6 +148,9 @@ class TakePool:
         if self.raw is not None:
             self.raw.close()
 
+    def pop_events(self):
+        return self.raw.pop_events() if self.raw is not None else []
+
 
 class TakeRateLimiter:
     SECOND_NS = 1_000_000_000
@@ -218,6 +221,31 @@ class ParallelTaker:
                 print(f"take_worker={take_worker_id} error={short_text(str(exc))}", flush=True)
             finally:
                 self.queue.task_done()
+
+    def run_response_logger(self) -> None:
+        while not self.stop_event.is_set():
+            for event in self.take_pool.pop_events():
+                record = {
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                    "type": "raw_h2_response",
+                    "order_id": event.order_id,
+                    "stream_id": event.stream_id,
+                    "status_code": event.status_code,
+                    "headers": event.headers,
+                    "error": event.error,
+                    "response_json": event.response_json,
+                    "response_text": short_text(event.response_text) if event.response_text and event.response_json is None else "",
+                    "timing_ms": {
+                        "response_after_send": round((event.received_ns - event.sent_ns) / 1_000_000, 3) if event.sent_ns else None,
+                    },
+                }
+                append_record(SAVE_PATH, record, self.file_lock)
+                print(
+                    f"raw_h2 response id={event.order_id} stream={event.stream_id} "
+                    f"status={event.status_code} error={short_text(event.error or '')}",
+                    flush=True,
+                )
+            sleep(0.05)
 
     def run_worker(self, worker_id: int) -> None:
         reconnects = 0
@@ -312,8 +340,9 @@ class ParallelTaker:
             "take_responses": [self._response_record(response) for response in responses],
         }
         append_record(SAVE_PATH, result, self.file_lock)
+        action = "take" if self.wait_take_response else "send"
         print(
-            f"worker={candidate.worker_id} take_worker={take_worker_id} take {'ok' if ok else 'failed'} "
+            f"worker={candidate.worker_id} take_worker={take_worker_id} {action} {'ok' if ok else 'failed'} "
             f"id={order_id} amount={candidate.amount} attempts={candidate.attempts} "
             f"queue={ms(take_started_at - candidate.queued_ns)} decision={ms(candidate.queued_ns - candidate.received_ns)} "
             f"{request_timing_name}={ms(take_finished_at - take_started_at)} total={ms(take_finished_at - candidate.received_ns)}",
@@ -400,8 +429,10 @@ def main() -> None:
         args.log_skips,
     )
     take_threads = [Thread(target=taker.run_take_worker, args=(worker_id,), daemon=True) for worker_id in range(1, args.take_workers + 1)]
+    response_thread = Thread(target=taker.run_response_logger, daemon=True)
     threads = [Thread(target=taker.run_worker, args=(worker_id,), daemon=False) for worker_id in range(1, args.connections + 1)]
     try:
+        response_thread.start()
         for thread in take_threads:
             thread.start()
         for thread in threads:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import random
 import secrets
 import socket
 import ssl
+from collections import deque
 from dataclasses import dataclass, field
 from threading import Lock, Thread
 from time import perf_counter_ns
@@ -12,6 +14,7 @@ from urllib.parse import urlparse
 
 from h2.config import H2Configuration
 from h2.connection import H2Connection
+from h2.events import ConnectionTerminated, DataReceived, ResponseReceived, StreamEnded, StreamReset
 import httpx
 
 BASE_URL = "https://app.send.tg"
@@ -32,6 +35,19 @@ class TakeHTTPResult:
     started_ns: int
     headers_ns: int
     finished_ns: int
+
+
+@dataclass(slots=True)
+class RawH2ResponseEvent:
+    order_id: str
+    stream_id: int
+    status_code: int | None
+    headers: dict[str, str]
+    response_json: dict[str, Any] | None
+    response_text: str
+    error: str | None
+    sent_ns: int
+    received_ns: int
 
 
 @dataclass(slots=True)
@@ -171,6 +187,8 @@ class RawH2TakeConnection:
         self.sock: ssl.SSLSocket | None = None
         self.conn: H2Connection | None = None
         self.reader: Thread | None = None
+        self.pending: dict[int, dict[str, Any]] = {}
+        self.events: deque[RawH2ResponseEvent] = deque(maxlen=1024)
 
     def open(self) -> None:
         self._connect_locked()
@@ -196,6 +214,7 @@ class RawH2TakeConnection:
                     started_ns = perf_counter_ns()
                     self.sock.sendall(data)
                     sent_ns = perf_counter_ns()
+                    self.pending[stream_id] = {"order_id": order_id, "sent_ns": sent_ns, "headers": {}, "body": bytearray()}
                 return TakeHTTPResult(None, None, "", {"mode": "raw-h2", "stream_id": str(stream_id)}, None, started_ns, sent_ns, sent_ns)
             except Exception as exc:
                 error = str(exc)
@@ -259,7 +278,9 @@ class RawH2TakeConnection:
                 with self.lock:
                     if sock is not self.sock or self.conn is None:
                         return
-                    self.conn.receive_data(data)
+                    events = self.conn.receive_data(data)
+                    for event in events:
+                        self._handle_event_locked(event)
                     outbound = self.conn.data_to_send()
                     if outbound:
                         sock.sendall(outbound)
@@ -272,8 +293,84 @@ class RawH2TakeConnection:
     def _reset_locked(self) -> None:
         sock, self.sock = self.sock, None
         self.conn = None
+        now = perf_counter_ns()
+        for stream_id, meta in self.pending.items():
+            self._append_event_locked(stream_id, meta, None, f"h2 connection reset", now)
+        self.pending.clear()
         if sock is not None:
             self._close_socket(sock)
+
+    def pop_events(self) -> list[RawH2ResponseEvent]:
+        with self.lock:
+            events = list(self.events)
+            self.events.clear()
+            return events
+
+    def _handle_event_locked(self, event: Any) -> None:
+        if isinstance(event, ResponseReceived):
+            meta = self.pending.setdefault(event.stream_id, {"order_id": "", "sent_ns": 0, "headers": {}, "body": bytearray()})
+            meta["headers"] = {name.lower(): value for name, value in event.headers}
+            return
+        if isinstance(event, DataReceived):
+            meta = self.pending.setdefault(event.stream_id, {"order_id": "", "sent_ns": 0, "headers": {}, "body": bytearray()})
+            meta["body"].extend(event.data)
+            if self.conn is not None:
+                self.conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+            return
+        if isinstance(event, StreamEnded):
+            meta = self.pending.pop(event.stream_id, None)
+            if meta is not None:
+                headers = meta.get("headers", {})
+                status = self._status(headers)
+                error = None if status is not None and 200 <= status < 300 else self._body_text(meta) or (f"HTTP {status}" if status is not None else "stream ended without status")
+                self._append_event_locked(event.stream_id, meta, status, error, perf_counter_ns())
+            return
+        if isinstance(event, StreamReset):
+            meta = self.pending.pop(event.stream_id, None)
+            if meta is not None:
+                self._append_event_locked(event.stream_id, meta, None, f"RST_STREAM {event.error_code}", perf_counter_ns())
+            return
+        if isinstance(event, ConnectionTerminated):
+            now = perf_counter_ns()
+            for stream_id, meta in self.pending.items():
+                self._append_event_locked(stream_id, meta, None, f"GOAWAY {event.error_code}", now)
+            self.pending.clear()
+
+    def _append_event_locked(self, stream_id: int, meta: dict[str, Any], status: int | None, error: str | None, received_ns: int) -> None:
+        text = self._body_text(meta)
+        self.events.append(
+            RawH2ResponseEvent(
+                str(meta.get("order_id", "")),
+                stream_id,
+                status,
+                dict(meta.get("headers", {})),
+                self._parse_body_json(text),
+                text,
+                error,
+                int(meta.get("sent_ns", 0)),
+                received_ns,
+            )
+        )
+
+    def _body_text(self, meta: dict[str, Any]) -> str:
+        body = bytes(meta.get("body", b""))
+        return body.decode("utf-8", "replace") if body else ""
+
+    def _parse_body_json(self, text: str) -> dict[str, Any] | None:
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else {"data": parsed}
+
+    def _status(self, headers: dict[str, str]) -> int | None:
+        value = headers.get(":status", "")
+        try:
+            return int(value)
+        except ValueError:
+            return None
 
     def _close_socket(self, sock: ssl.SSLSocket) -> None:
         try:
@@ -308,3 +405,9 @@ class RawH2TakePool:
 
     def take_payment_burst_sent(self, order_id: str, attempts: int) -> list[TakeHTTPResult]:
         return [self.take_payment_sent(order_id) for _ in range(attempts)]
+
+    def pop_events(self) -> list[RawH2ResponseEvent]:
+        events: list[RawH2ResponseEvent] = []
+        for connection in self.connections:
+            events.extend(connection.pop_events())
+        return events
