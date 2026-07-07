@@ -62,6 +62,9 @@ class CryptoBotAPI:
     def open(self) -> None:
         self._ensure_client()
 
+    def update_cookie_header(self, cookie: str) -> None:
+        self.cookie = cookie
+
     def preconnect(self) -> None:
         self.get_onboarding_state()
 
@@ -201,6 +204,9 @@ class RawH2TakeConnection:
             sock, self.sock = self.sock, None
         if sock is not None:
             self._close_socket(sock)
+
+    def update_cookie_header(self, cookie: str) -> None:
+        self.header_builder.update_cookie_header(cookie)
 
     def send_take(self, order_id: str) -> TakeHTTPResult:
         started_ns = perf_counter_ns()
@@ -453,6 +459,10 @@ class RawH2TakePool:
     def close(self) -> None:
         for connection in self.connections:
             connection.close()
+
+    def update_cookie_header(self, cookie: str) -> None:
+        for connection in self.connections:
+            connection.update_cookie_header(cookie)
 
     def take_payment_sent(self, order_id: str) -> TakeHTTPResult:
         connection = self._next_ready_connection()

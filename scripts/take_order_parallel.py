@@ -113,6 +113,28 @@ def age_text(now_ns: int, created_ns: int | None) -> str:
     return "unknown" if value is None else f"{value:.3f}ms"
 
 
+def merge_set_cookie(cookie_header: str, set_cookie: str) -> str:
+    pair = set_cookie.split(";", 1)[0].strip()
+    if not pair or "=" not in pair:
+        return cookie_header
+    name, value = pair.split("=", 1)
+    items = []
+    replaced = False
+    for item in cookie_header.split(";"):
+        part = item.strip()
+        if not part or "=" not in part:
+            continue
+        key, current = part.split("=", 1)
+        if key == name:
+            items.append(f"{name}={value}")
+            replaced = True
+        else:
+            items.append(f"{key}={current}")
+    if not replaced:
+        items.append(f"{name}={value}")
+    return "; ".join(items)
+
+
 @dataclass(slots=True)
 class TakeCandidate:
     worker_id: int
@@ -168,6 +190,12 @@ class TakePool:
         if self.raw is not None:
             self.raw.close()
 
+    def update_cookie_header(self, cookie: str) -> None:
+        if self.api is not None:
+            self.api.update_cookie_header(cookie)
+        if self.raw is not None:
+            self.raw.update_cookie_header(cookie)
+
     def pop_events(self):
         return self.raw.pop_events() if self.raw is not None else []
 
@@ -214,6 +242,7 @@ class ParallelTaker:
         log_skips: bool,
     ) -> None:
         self.cookie = cookie
+        self.cookie_lock = Lock()
         self.min_limit = min_limit
         self.max_limit = max_limit
         self.wait_take_response = wait_take_response
@@ -297,11 +326,18 @@ class ParallelTaker:
                 cf_colo = edge_headers.get("cf-colo", "") if isinstance(edge_headers, dict) else ""
                 print(f"worker={worker_id} socket connected sid={sid} cf_ray={cf_ray} colo={cf_colo}", flush=True)
                 ws_edge_headers = edge_headers if isinstance(edge_headers, dict) else {}
+                set_cookie = ws_edge_headers.get("set-cookie", "")
+                if set_cookie:
+                    with self.cookie_lock:
+                        updated = merge_set_cookie(self.cookie, set_cookie)
+                        if updated != self.cookie:
+                            self.cookie = updated
+                            self.take_pool.update_cookie_header(updated)
                 return None
             if record.get("type") != "socketio_event":
                 return None
-            received_at = perf_counter_ns()
-            received_wall_at = time_ns()
+            received_at = int(record.get("received_perf_ns") or perf_counter_ns())
+            received_wall_at = int(record.get("received_wall_ns") or time_ns())
             for order in extract_candidates(record):
                 self._try_enqueue(worker_id, order, received_at, received_wall_at, ws_edge_headers)
             return None

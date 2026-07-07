@@ -9,6 +9,7 @@ import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter_ns, time_ns
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -88,7 +89,11 @@ class CryptoBotSocketClient:
     def _handle_message(self, conn: ssl.SSLSocket, message: str, on_record: Callable[[dict[str, Any]], bool | None] | None = None) -> bool | None:
         if not message:
             return
+        received_perf_ns = perf_counter_ns()
+        received_wall_ns = time_ns()
         parsed = self._parse_message(message)
+        parsed["received_perf_ns"] = received_perf_ns
+        parsed["received_wall_ns"] = received_wall_ns
         if parsed["type"] == "socketio_connect" and not self.initialized:
             conn.sendall(self._ws_frame('42["list:initialize"]'))
             self.initialized = True
